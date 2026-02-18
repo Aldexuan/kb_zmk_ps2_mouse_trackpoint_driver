@@ -182,36 +182,23 @@ static void filter_with_input_config(const struct input_listener_ps2_config *cfg
     }
 
     evt->value = (int16_t)((evt->value * cfg->scale_multiplier) / cfg->scale_divisor);
-     if (cfg->scroll_layer >= 0 && zmk_keymap_highest_layer_active() == cfg->scroll_layer) {
-    // 判断是否启用了 xy-swap，适配轴交换后的滚轮映射
-    if (cfg->xy_swap) {
-        // 启用 xy-swap：原X↔Y，需要交换滚轮映射
-        switch (evt->code) {
-        case INPUT_REL_X: // 原生X（轨迹球上下）→ 纵向滚轮（WHEEL）
-            evt->code = INPUT_REL_WHEEL;
-            evt->value = -(evt->value); // 保持和原Y相同的方向取反
-            break;
-        case INPUT_REL_Y: // 原生Y（轨迹球左右）→ 横向滚轮（HWHEEL）
-            evt->code = INPUT_REL_HWHEEL;
-            // 横向滚轮无需取反（原X也没取反）
-            break;
-        }
-    } else {
-        // 未启用 xy-swap：保留原有逻辑
+    if (cfg->scroll_layer >= 0 && zmk_keymap_highest_layer_active() == cfg->scroll_layer) {
         switch (evt->code) {
         case INPUT_REL_X:
             evt->code = INPUT_REL_HWHEEL;
+            // 如果开启了xy-swap，水平滚动需要反转方向（补偿轴交换的影响）
+            if (cfg->xy_swap) {
+                evt->value = -(evt->value);
+            }
             break;
         case INPUT_REL_Y:
             evt->code = INPUT_REL_WHEEL;
-            evt->value = -(evt->value);
+            // 如果开启了xy-swap，取消原有反转（避免双重反转）；否则保留原有反转
+            evt->value = cfg->xy_swap ? evt->value : -(evt->value);
             break;
         }
+        evt->value = (int16_t)((evt->value * 1) / 2);
     }
-    // 缩放滚动速度（原有逻辑保留）
-    evt->value = (int16_t)((evt->value * 1) / 2);
-}
-
 
 }
 

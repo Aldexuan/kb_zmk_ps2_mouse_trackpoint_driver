@@ -39,8 +39,13 @@ properties:
     default: -1
     required: false
     description: The layer index that activates scroll mode when it is the highest active layer.
-  scroll-speed-level:
+  scroll-speed-num:
     type: int
-    default: 5
+    default: 1
     required: false
-    description: Scroll speed level (1=10%、2=20%...10=100%)
+    description: Numerator for scroll speed scaling factor (e.g., 1 for 1/10 speed, 2 for 2/10=1/5 speed)
+  scroll-speed-den:
+    type: int
+    default: 2
+    required: false
+    description: Denominator for scroll speed scaling factor (e.g., 10 for 1/10 speed, 20 for 1/20 speed)

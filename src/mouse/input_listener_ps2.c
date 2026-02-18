@@ -70,7 +70,8 @@ struct input_listener_ps2_config {
     int layer_toggle_delay_ms;
     int layer_toggle_timeout_ms;
     int scroll_layer;
-    int scroll_speed_level;
+    int scroll_speed_num;
+    int scroll_speed_den;
 };
 
 void zmk_input_listener_ps2_layer_toggle_input_rel_received(
@@ -198,7 +199,7 @@ static void filter_with_input_config(const struct input_listener_ps2_config *cfg
             evt->value = cfg->xy_swap ? evt->value : -(evt->value);
             break;
         }
-        evt->value = (int16_t)((evt->value * cfg->scroll_speed_level) / 20);
+        evt->value = (int16_t)((evt->value * cfg->scroll_speed_num) / cfg->scroll_speed_den);
     }
 
 }
@@ -357,7 +358,8 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                             .layer_toggle_delay_ms = DT_INST_PROP(n, layer_toggle_delay_ms),       \
                             .layer_toggle_timeout_ms = DT_INST_PROP(n, layer_toggle_timeout_ms),   \
                             .scroll_layer = DT_INST_PROP(n, scroll_layer),                         \
-                            .scroll_speed_level = DT_INST_PROP(n, scroll_speed_level),             \
+                            .scroll_speed_num = DT_INST_PROP(n, scroll_speed_num),                 \
+                            .scroll_speed_den = DT_INST_PROP(n, scroll_speed_den),                 \
                         };                                                                         \
                     static struct input_listener_ps2_data data_##n =                               \
                         {                                                                          \

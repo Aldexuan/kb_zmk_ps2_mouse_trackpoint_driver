@@ -41,6 +41,6 @@ properties:
     description: The layer index that activates scroll mode when it is the highest active layer.
   scroll-speed-level:
     type: int
-    default: 4
+    default: 5
     required: false
-    description: Scroll speed level (1=25%,2=50%,4=100%,5=125%,6=150%,8=200%,12=300%)
+    description: Scroll speed level (1=10%、2=20%...10=100%)

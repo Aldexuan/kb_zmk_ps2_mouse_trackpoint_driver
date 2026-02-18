@@ -198,7 +198,7 @@ static void filter_with_input_config(const struct input_listener_ps2_config *cfg
             evt->value = cfg->xy_swap ? evt->value : -(evt->value);
             break;
         }
-        evt->value = (int16_t)((evt->value * cfg->scroll_speed_level) / 4);
+        evt->value = (int16_t)((evt->value * cfg->scroll_speed_level) / 10);
     }
 
 }

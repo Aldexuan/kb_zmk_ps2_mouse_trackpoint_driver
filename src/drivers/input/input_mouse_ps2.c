@@ -43,7 +43,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 // Specification`...
 // "The POR shall be timed to occur 600 ms ± 20 % from the time power is
 //  applied to the TrackPoint controller."
-#define MOUSE_PS2_POWER_ON_RESET_TIME K_MSEC(600)
+#define MOUSE_PS2_POWER_ON_RESET_TIME K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_ON_RESET_TIME)
 
 // Common PS/2 Mouse commands
 #define MOUSE_PS2_CMD_GET_DEVICE_ID "\xf2"
@@ -358,14 +358,14 @@ void zmk_mouse_ps2_activity_callback(const struct device *ps2_device, uint8_t by
 
 void zmk_mouse_ps2_activity_abort_cmd(char *reason) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
-    const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
-    const struct device *ps2_device = config->ps2_device;
+    // const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
 
-    LOG_ERR("PS/2 Mouse cmd buffer is out of aligment. Requesting resend: %s", reason);
+    // LOG_ERR("PS/2 Mouse cmd buffer is out of aligment. Requesting resend: %s", reason);
+    // ps2_write(ps2_device, MOUSE_PS2_CMD_RESEND[0]);
+    LOG_ERR(
+        "PS/2 Mouse cmd buffer is out of alignment. igoring..."); // resend somehow make it worse
 
     data->packet_idx = 0;
-    ps2_write(ps2_device, MOUSE_PS2_CMD_RESEND[0]);
-
     zmk_mouse_ps2_activity_reset_packet_buffer();
 }
 

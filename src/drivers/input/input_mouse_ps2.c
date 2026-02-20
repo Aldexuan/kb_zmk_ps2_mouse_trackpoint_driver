@@ -453,7 +453,6 @@ void zmk_mouse_ps2_activity_process_cmd(zmk_mouse_ps2_packet_mode packet_mode, u
                                    (y_delta >= MOUSE_PS2_MIN_MOVEMENT_THRESHOLD);
 
     // ADDITIONAL: TrackPoint device type validation
-    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
     bool is_valid_trackpoint_data = true;
     
     // For non-TrackPoint devices, be more strict about what constitutes movement

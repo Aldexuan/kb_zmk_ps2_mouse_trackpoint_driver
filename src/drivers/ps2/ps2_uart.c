@@ -1211,7 +1211,6 @@ static int ps2_uart_enable_callback(const struct device *dev) {
 
 static int ps2_uart_pm_action(const struct device *dev, enum pm_device_action action)
 {
-    struct ps2_uart_data *data = dev->data;
     struct ps2_uart_config *config = (struct ps2_uart_config *)dev->config;
     int ret = 0;
 

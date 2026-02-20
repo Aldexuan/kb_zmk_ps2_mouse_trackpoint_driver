@@ -58,6 +58,7 @@ struct input_listener_ps2_data {
     int64_t layer_toggle_last_mouse_package_time;
     struct k_work_delayable layer_toggle_activation_delay;
     struct k_work_delayable layer_toggle_deactivation_delay;
+    int64_t last_scroll_report_time;
 };
 
 struct input_listener_ps2_config {
@@ -184,22 +185,33 @@ static void filter_with_input_config(const struct input_listener_ps2_config *cfg
     }
 
     evt->value = (int16_t)((evt->value * cfg->scale_multiplier) / cfg->scale_divisor);
-    if (cfg->scroll_layer >= 0 && zmk_keymap_highest_layer_active() == cfg->scroll_layer) {
-        switch (evt->code) {
-        case INPUT_REL_X:
-            evt->code = INPUT_REL_HWHEEL;
-            // 如果开启了xy-swap，水平滚动需要反转方向（补偿轴交换的影响）
-            if (cfg->xy_swap) {
-                evt->value = -(evt->value);
-            }
-            break;
-        case INPUT_REL_Y:
-            evt->code = INPUT_REL_WHEEL;
-            // 如果开启了xy-swap，取消原有反转（避免双重反转）；否则保留原有反转
-            evt->value = cfg->xy_swap ? evt->value : -(evt->value);
-            break;
+
+
+    if (cfg->scroll_layer >=0 && zmk_keymap_highest_layer_active() == cfg->scroll_layer) {
+        int16_t original_val = evt->value;
+        int16_t scaled_val = original_val;
+
+        if (abs(original_val) >= 128) scaled_val = original_val /24;
+        else if (abs(original_val)>=64) scaled_val = original_val /16;
+        else if (abs(original_val)>=32) scaled_val = original_val /12;
+        else if (abs(original_val)>=21) scaled_val = original_val /8;
+        else if (abs(original_val)>=3) scaled_val = original_val>0?1:-1;
+        else scaled_val = 0;
+
+        // 步骤3：保留原轴映射+方向补偿（仅替换值为分级后的值）
+        switch(evt->code) {
+            case INPUT_REL_X:
+                evt->code = INPUT_REL_HWHEEL;
+                if (cfg->xy_swap) scaled_val = -scaled_val; // 保留xy_swap补偿
+                break;
+            case INPUT_REL_Y:
+                evt->code = INPUT_REL_WHEEL;
+                scaled_val = cfg->xy_swap ? scaled_val : -scaled_val; // 保留补偿
+                break;
         }
-        evt->value = (int16_t)((evt->value * cfg->scroll_speed_num) / cfg->scroll_speed_den);
+
+        // 步骤4：最终赋值（分级后的值）
+        evt->value = scaled_val;
     }
 
 }
@@ -232,6 +244,14 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
     }
 
     if (evt->sync) {
+        if (cfg->scroll_layer >=0 && zmk_keymap_highest_layer_active() == cfg->scroll_layer) {
+            int64_t now = k_uptime_get();
+            if (now - data->last_scroll_report_time < 40) { // 40ms节流间隔
+                clear_xy_data(&data->mouse.wheel_data); // 清空本次数据
+                return; // 跳过上报
+            }
+            data->last_scroll_report_time = now; // 更新时间戳
+        }
         if (data->mouse.wheel_data.mode == INPUT_LISTENER_XY_DATA_MODE_REL) {
             zmk_hid_mouse_scroll_set(data->mouse.wheel_data.x, data->mouse.wheel_data.y);
         }

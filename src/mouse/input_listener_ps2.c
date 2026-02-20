@@ -429,7 +429,7 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                             .scroll_speed_num = DT_INST_PROP(n, scroll_speed_num),                 \
                             .scroll_speed_den = DT_INST_PROP(n, scroll_speed_den),                 \
                             // ========== 新增：默认休眠阈值500ms ==========
-                            .idle_sleep_threshold_ms = DT_INST_PROP_OR(n, idle_sleep_threshold_ms, 500), \
+                            .idle_sleep_threshold_ms = DT_INST_PROP_OR(n, idle_sleep_threshold_ms), \
                         };                                                                         \
                     static struct input_listener_ps2_data data_##n =                               \
                         {                                                                          \

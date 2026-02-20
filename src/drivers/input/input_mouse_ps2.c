@@ -446,20 +446,33 @@ void zmk_mouse_ps2_activity_process_cmd(zmk_mouse_ps2_packet_mode packet_mode, u
     int y_delta = abs(data->prev_packet.mov_y - packet.mov_y);
 
     // Filter out noise - only consider significant movement as real user activity
+    // REMOVED: Button events no longer affect activity detection
     bool has_significant_movement = (abs(packet.mov_x) >= MOUSE_PS2_MIN_MOVEMENT_THRESHOLD) || 
                                    (abs(packet.mov_y) >= MOUSE_PS2_MIN_MOVEMENT_THRESHOLD) ||
                                    (x_delta >= MOUSE_PS2_MIN_MOVEMENT_THRESHOLD) ||
                                    (y_delta >= MOUSE_PS2_MIN_MOVEMENT_THRESHOLD);
 
+    // ADDITIONAL: TrackPoint device type validation
+    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+    bool is_valid_trackpoint_data = true;
+    
+    // For non-TrackPoint devices, be more strict about what constitutes movement
+    if (!data->is_trackpoint) {
+        // Generic PS/2 mice - require larger movements to count as activity
+        is_valid_trackpoint_data = (abs(packet.mov_x) >= 5) || (abs(packet.mov_y) >= 5);
+        LOG_DBG("Non-TrackPoint device detected, applying stricter filtering");
+    }
+
     LOG_DBG("Got mouse activity cmd "
             "(mov_x=%d, mov_y=%d, o_x=%d, o_y=%d, scroll=%d, "
             "b_l=%d, b_m=%d, b_r=%d) and ("
-            "x_delta=%d, y_delta=%d, significant=%d)",
+            "x_delta=%d, y_delta=%d, significant=%d, is_trackpoint=%d, valid_data=%d)",
             packet.mov_x, packet.mov_y, packet.overflow_x, packet.overflow_y, packet.scroll,
-            packet.button_l, packet.button_m, packet.button_r, x_delta, y_delta, has_significant_movement);
+            packet.button_l, packet.button_m, packet.button_r, x_delta, y_delta, 
+            has_significant_movement, data->is_trackpoint, is_valid_trackpoint_data);
 
-    // Update activity time only for significant movements or button events
-    if (has_significant_movement || packet.button_l || packet.button_m || packet.button_r) {
+    // Update activity time ONLY for significant movements on valid TrackPoint data (buttons excluded)
+    if (has_significant_movement && is_valid_trackpoint_data) {
         zmk_mouse_ps2_update_activity_time();
     }
 

@@ -404,7 +404,6 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                           zmk_input_listener_ps2_layer_toggle_activate_layer);
     k_work_init_delayable(&data->layer_toggle_deactivation_delay,
                           zmk_input_listener_ps2_layer_toggle_deactivate_layer);
-    // ========== 新增：初始化有效输入标记 ==========
     data->has_valid_input = false;
 
     return 0;
@@ -435,7 +434,6 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                             .dev = DEVICE_DT_INST_GET(n),                                          \
                             .layer_toggle_layer_enabled = false,                                   \
                             .layer_toggle_last_mouse_package_time = 0,                             \
-                            // ========== 新增：初始化休眠相关标记 ==========
                             .has_valid_input = false,                                              \
                             .last_scroll_report_time = 0,                                          \
                         };                                                                         \

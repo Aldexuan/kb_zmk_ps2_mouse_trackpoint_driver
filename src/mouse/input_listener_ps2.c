@@ -220,38 +220,6 @@ static void clear_xy_data(struct input_listener_ps2_xy_data *data) {
     data->mode = INPUT_LISTENER_XY_DATA_MODE_NONE;
 }
 
-// 新增：全局状态重置函数，用于初始化和异常恢复
-static void reset_mouse_state(struct input_listener_ps2_data *data) {
-    // 清零位移数据
-    clear_xy_data(&data->mouse.data);
-    clear_xy_data(&data->mouse.wheel_data);
-
-    // 清零按键状态
-    data->mouse.button_set = 0;
-    data->mouse.button_clear = 0;
-
-    // 重置时间戳
-    data->layer_toggle_last_mouse_package_time = 0;
-    data->last_scroll_report_time = 0;
-
-    // 重置图层状态
-    data->layer_toggle_layer_enabled = false;
-
-    // 清空HID报告中的鼠标状态（关键！）
-    zmk_hid_mouse_movement_set(0, 0);
-    zmk_hid_mouse_scroll_set(0, 0);
-
-    // 释放所有鼠标按键
-    for (int i = 0; i < ZMK_MOUSE_HID_NUM_BUTTONS; i++) {
-        zmk_hid_mouse_button_release(i);
-    }
-
-    // 发送空报告确保状态同步
-    zmk_endpoints_send_mouse_report();
-
-    LOG_DBG("Mouse state reset completed");
-}
-
 static void input_handler_ps2(const struct input_listener_ps2_config *config,
                               struct input_listener_ps2_data *data, struct input_event *evt) {
     // First, filter to update the event data as needed.
@@ -429,7 +397,6 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                         struct input_listener_ps2_data *data = dev->data;                          \
                         const struct input_listener_ps2_config *config = dev->config;              \
                                                                                                    \
-                        reset_mouse_state(data);                                                   \
                         zmk_input_listener_ps2_layer_toggle_init(config, data);                    \
                                                                                                    \
                         return 0;                                                                  \

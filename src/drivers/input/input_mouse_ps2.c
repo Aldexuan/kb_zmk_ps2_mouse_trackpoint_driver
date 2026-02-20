@@ -17,6 +17,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/pm/device.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
@@ -34,6 +35,11 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 // This defines how much time between bytes can pass before
 // we give up on the packet and start fresh.
 #define MOUSE_PS2_TIMEOUT_ACTIVITY_PACKET K_MSEC(500)
+
+// Idle detection settings for power optimization
+#define MOUSE_PS2_IDLE_THRESHOLD_MS CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_THRESHOLD_MS
+#define MOUSE_PS2_IDLE_CHECK_INTERVAL_MS 1000
+#define MOUSE_PS2_MIN_MOVEMENT_THRESHOLD 2
 
 /*
  * PS/2 Defines
@@ -209,6 +215,12 @@ struct zmk_mouse_ps2_data {
     uint8_t manufacturer_id;
     uint8_t secondary_id;
     uint8_t rom_id;
+    
+    // Idle detection variables for power saving
+    int64_t last_activity_time;
+    struct k_timer idle_timer;
+    struct k_work_delayable idle_check_work;
+    bool is_idle_mode;
 
     uint8_t sampling_rate;
     uint8_t tp_sensitivity;
@@ -273,6 +285,10 @@ static struct zmk_mouse_ps2_data zmk_mouse_ps2_data = {
     .manufacturer_id = 0x0,
     .secondary_id = 0x0,
     .rom_id = 0x0,
+    
+    // Idle detection initialization
+    .last_activity_time = 0,
+    .is_idle_mode = false,
 
     // PS2 devices initialize with this rate
     .sampling_rate = MOUSE_PS2_CMD_SET_SAMPLING_RATE_DEFAULT,
@@ -316,10 +332,24 @@ zmk_mouse_ps2_activity_parse_packet_buffer(zmk_mouse_ps2_packet_mode packet_mode
                                            uint8_t packet_extra);
 void zmk_mouse_ps2_activity_toggle_layer();
 
+// Power saving idle detection functions
+void zmk_mouse_ps2_idle_check_handler(struct k_work *work);
+void zmk_mouse_ps2_enter_idle_mode();
+void zmk_mouse_ps2_exit_idle_mode();
+void zmk_mouse_ps2_update_activity_time();
+
 // Called by the PS/2 driver whenver the mouse sends a byte and
 // reporting is enabled through `zmk_mouse_ps2_activity_reporting_enable`.
 void zmk_mouse_ps2_activity_callback(const struct device *ps2_device, uint8_t byte) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+
+    // Update activity time on any data reception for power management
+    zmk_mouse_ps2_update_activity_time();
+    
+    // Exit idle mode immediately when data is received
+    if (data->is_idle_mode) {
+        zmk_mouse_ps2_exit_idle_mode();
+    }
 
     k_work_cancel_delayable(&data->packet_buffer_timeout);
 
@@ -415,12 +445,23 @@ void zmk_mouse_ps2_activity_process_cmd(zmk_mouse_ps2_packet_mode packet_mode, u
     int x_delta = abs(data->prev_packet.mov_x - packet.mov_x);
     int y_delta = abs(data->prev_packet.mov_y - packet.mov_y);
 
+    // Filter out noise - only consider significant movement as real user activity
+    bool has_significant_movement = (abs(packet.mov_x) >= MOUSE_PS2_MIN_MOVEMENT_THRESHOLD) || 
+                                   (abs(packet.mov_y) >= MOUSE_PS2_MIN_MOVEMENT_THRESHOLD) ||
+                                   (x_delta >= MOUSE_PS2_MIN_MOVEMENT_THRESHOLD) ||
+                                   (y_delta >= MOUSE_PS2_MIN_MOVEMENT_THRESHOLD);
+
     LOG_DBG("Got mouse activity cmd "
             "(mov_x=%d, mov_y=%d, o_x=%d, o_y=%d, scroll=%d, "
             "b_l=%d, b_m=%d, b_r=%d) and ("
-            "x_delta=%d, y_delta=%d)",
+            "x_delta=%d, y_delta=%d, significant=%d)",
             packet.mov_x, packet.mov_y, packet.overflow_x, packet.overflow_y, packet.scroll,
-            packet.button_l, packet.button_m, packet.button_r, x_delta, y_delta);
+            packet.button_l, packet.button_m, packet.button_r, x_delta, y_delta, has_significant_movement);
+
+    // Update activity time only for significant movements or button events
+    if (has_significant_movement || packet.button_l || packet.button_m || packet.button_r) {
+        zmk_mouse_ps2_update_activity_time();
+    }
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_ENABLE_ERROR_MITIGATION)
     if (packet.overflow_x == 1 && packet.overflow_y == 1) {
@@ -638,6 +679,72 @@ void zmk_mouse_ps2_activity_click_buttons(bool button_l, bool button_m, bool but
                 data->button_m_is_held = false;
             }
         }
+    }
+}
+
+/*
+ * Power Saving Idle Detection Implementation
+ */
+
+// Update the timestamp of last user activity
+void zmk_mouse_ps2_update_activity_time() {
+    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+    data->last_activity_time = k_uptime_get();
+}
+
+// Enter low power idle mode to reduce consumption
+void zmk_mouse_ps2_enter_idle_mode() {
+    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+    
+    if (data->is_idle_mode) {
+        return; // Already in idle mode
+    }
+    
+    LOG_INF("Entering idle mode to reduce power consumption");
+    
+    // Disable data reporting to reduce power usage
+    zmk_mouse_ps2_activity_reporting_disable();
+    
+    data->is_idle_mode = true;
+    
+    // Schedule periodic checks to detect when activity resumes
+    k_work_schedule(&data->idle_check_work, K_MSEC(MOUSE_PS2_IDLE_CHECK_INTERVAL_MS));
+}
+
+// Exit idle mode and resume normal operation
+void zmk_mouse_ps2_exit_idle_mode() {
+    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+    
+    if (!data->is_idle_mode) {
+        return; // Not in idle mode
+    }
+    
+    LOG_INF("Exiting idle mode - user activity detected");
+    
+    // Cancel scheduled idle checks
+    k_work_cancel_delayable(&data->idle_check_work);
+    
+    // Re-enable data reporting
+    zmk_mouse_ps2_activity_reporting_enable();
+    
+    data->is_idle_mode = false;
+}
+
+// Periodic handler to check for idle timeout
+void zmk_mouse_ps2_idle_check_handler(struct k_work *work) {
+    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+    int64_t current_time = k_uptime_get();
+    int64_t time_since_last_activity = current_time - data->last_activity_time;
+    
+    LOG_DBG("Idle check: time since last activity = %lld ms (threshold: %d ms)", 
+            time_since_last_activity, MOUSE_PS2_IDLE_THRESHOLD_MS);
+    
+    if (time_since_last_activity >= MOUSE_PS2_IDLE_THRESHOLD_MS) {
+        // Enter idle mode if threshold exceeded
+        zmk_mouse_ps2_enter_idle_mode();
+    } else {
+        // Continue monitoring - schedule next check
+        k_work_schedule(&data->idle_check_work, K_MSEC(MOUSE_PS2_IDLE_CHECK_INTERVAL_MS));
     }
 }
 
@@ -1732,6 +1839,13 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
     }
 
     k_work_init_delayable(&data->packet_buffer_timeout, zmk_mouse_ps2_activity_packet_timout);
+    
+    // Initialize power saving idle detection
+    k_work_init_delayable(&data->idle_check_work, zmk_mouse_ps2_idle_check_handler);
+    data->last_activity_time = k_uptime_get();
+    
+    // Start initial idle monitoring after system stabilization
+    k_work_schedule(&data->idle_check_work, K_SECONDS(5));
 
     return;
 }

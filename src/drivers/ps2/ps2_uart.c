@@ -14,6 +14,7 @@
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/pm/device.h>
 
 #include <hal/nrf_uarte.h>
 
@@ -1208,6 +1209,46 @@ static int ps2_uart_enable_callback(const struct device *dev) {
     return 0;
 }
 
+static int ps2_uart_pm_action(const struct device *dev, enum pm_device_action action)
+{
+    struct ps2_uart_data *data = dev->data;
+    struct ps2_uart_config *config = (struct ps2_uart_config *)dev->config;
+    int ret = 0;
+
+    switch (action) {
+    case PM_DEVICE_ACTION_SUSPEND:
+        LOG_DBG("PS/2 UART entering suspend mode");
+        
+        // Disable UART interrupts during suspend
+        if (device_is_ready(config->uart_dev)) {
+            uart_irq_rx_disable(config->uart_dev);
+            uart_irq_err_disable(config->uart_dev);
+        }
+        
+        // Disable GPIO callback
+        ps2_uart_set_scl_callback_enabled(false);
+        break;
+
+    case PM_DEVICE_ACTION_RESUME:
+        LOG_DBG("PS/2 UART resuming from suspend");
+        
+        // Re-enable GPIO callback
+        ps2_uart_set_scl_callback_enabled(true);
+        
+        // Re-enable UART interrupts
+        if (device_is_ready(config->uart_dev)) {
+            uart_irq_rx_enable(config->uart_dev);
+            uart_irq_err_enable(config->uart_dev);
+        }
+        break;
+
+    default:
+        return -ENOTSUP;
+    }
+
+    return ret;
+}
+
 static const struct ps2_driver_api ps2_uart_driver_api = {
     .config = ps2_uart_configure,
     .read = ps2_uart_read,
@@ -1357,5 +1398,7 @@ static int ps2_uart_init_gpio(void) {
     return err;
 }
 
-DEVICE_DT_INST_DEFINE(0, &ps2_uart_init, NULL, &ps2_uart_data, &ps2_uart_config, POST_KERNEL, 80,
+PM_DEVICE_DT_INST_DEFINE(0, ps2_uart_pm_action);
+
+DEVICE_DT_INST_DEFINE(0, &ps2_uart_init, PM_DEVICE_DT_INST_GET(0), &ps2_uart_data, &ps2_uart_config, POST_KERNEL, 80,
                       &ps2_uart_driver_api);

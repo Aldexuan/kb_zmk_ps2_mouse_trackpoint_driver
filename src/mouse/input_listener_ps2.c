@@ -5,7 +5,7 @@
  */
 
 #define DT_DRV_COMPAT zmk_input_listener_ps2
-
+#include <stdlib.h>
 #include <zephyr/device.h>
 #include <zephyr/kernel.h>
 #include <zephyr/input/input.h>
@@ -198,15 +198,14 @@ static void filter_with_input_config(const struct input_listener_ps2_config *cfg
         else if (abs(original_val)>=3) scaled_val = original_val>0?1:-1;
         else scaled_val = 0;
 
-        // 步骤3：保留原轴映射+方向补偿（仅替换值为分级后的值）
         switch(evt->code) {
             case INPUT_REL_X:
                 evt->code = INPUT_REL_HWHEEL;
-                if (cfg->xy_swap) scaled_val = -scaled_val; // 保留xy_swap补偿
+                if (cfg->xy_swap) scaled_val = -scaled_val;
                 break;
             case INPUT_REL_Y:
                 evt->code = INPUT_REL_WHEEL;
-                scaled_val = cfg->xy_swap ? scaled_val : -scaled_val; // 保留补偿
+                scaled_val = cfg->xy_swap ? scaled_val : -scaled_val;
                 break;
         }
 
@@ -248,6 +247,8 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
             int64_t now = k_uptime_get();
             if (now - data->last_scroll_report_time < 40) { // 40ms节流间隔
                 clear_xy_data(&data->mouse.wheel_data); // 清空本次数据
+                // 清空按键状态，避免残留
+                data->mouse.button_set = data->mouse.button_clear = 0;
                 return; // 跳过上报
             }
             data->last_scroll_report_time = now; // 更新时间戳

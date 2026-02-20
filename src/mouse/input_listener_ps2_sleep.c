@@ -59,8 +59,10 @@ struct input_listener_ps2_data {
     struct k_work_delayable layer_toggle_activation_delay;
     struct k_work_delayable layer_toggle_deactivation_delay;
     int64_t last_scroll_report_time;
-    // ========== 新增：标记是否有有效输入事件 ==========
+    // 新增：标记是否有有效输入事件
     bool has_valid_input;
+    // 新增：标记是否处于深度空闲状态
+    bool is_deep_idle;
 };
 
 struct input_listener_ps2_config {
@@ -75,7 +77,7 @@ struct input_listener_ps2_config {
     int scroll_layer;
     int scroll_speed_num;
     int scroll_speed_den;
-    // ========== 新增：静态休眠阈值（ms） ==========
+    // 新增：静态休眠阈值（ms）- 使用默认值避免未配置时出错
     int idle_sleep_threshold_ms;
 };
 
@@ -112,26 +114,34 @@ static void handle_rel_code(struct input_listener_ps2_data *data, struct input_e
     case INPUT_REL_X:
         data->mouse.data.mode = INPUT_LISTENER_XY_DATA_MODE_REL;
         data->mouse.data.x += evt->value;
-        // ========== 新增：标记有效输入 ==========
-        if (evt->value != 0) data->has_valid_input = true;
+        if (evt->value != 0) {
+            data->has_valid_input = true;
+            data->is_deep_idle = false; // 退出深度空闲
+        }
         break;
     case INPUT_REL_Y:
         data->mouse.data.mode = INPUT_LISTENER_XY_DATA_MODE_REL;
         data->mouse.data.y += evt->value;
-        // ========== 新增：标记有效输入 ==========
-        if (evt->value != 0) data->has_valid_input = true;
+        if (evt->value != 0) {
+            data->has_valid_input = true;
+            data->is_deep_idle = false; // 退出深度空闲
+        }
         break;
     case INPUT_REL_WHEEL:
         data->mouse.wheel_data.mode = INPUT_LISTENER_XY_DATA_MODE_REL;
         data->mouse.wheel_data.y += evt->value;
-        // ========== 新增：标记有效输入 ==========
-        if (evt->value != 0) data->has_valid_input = true;
+        if (evt->value != 0) {
+            data->has_valid_input = true;
+            data->is_deep_idle = false; // 退出深度空闲
+        }
         break;
     case INPUT_REL_HWHEEL:
         data->mouse.wheel_data.mode = INPUT_LISTENER_XY_DATA_MODE_REL;
         data->mouse.wheel_data.x += evt->value;
-        // ========== 新增：标记有效输入 ==========
-        if (evt->value != 0) data->has_valid_input = true;
+        if (evt->value != 0) {
+            data->has_valid_input = true;
+            data->is_deep_idle = false; // 退出深度空闲
+        }
         break;
     default:
         break;
@@ -157,8 +167,8 @@ static void handle_key_code(const struct input_listener_ps2_config *config,
         } else {
             WRITE_BIT(data->mouse.button_clear, btn, 1);
         }
-        // ========== 新增：标记有效输入 ==========
         data->has_valid_input = true;
+        data->is_deep_idle = false; // 退出深度空闲
         break;
     default:
         break;
@@ -200,7 +210,6 @@ static void filter_with_input_config(const struct input_listener_ps2_config *cfg
 
     evt->value = (int16_t)((evt->value * cfg->scale_multiplier) / cfg->scale_divisor);
 
-
     if (cfg->scroll_layer >=0 && zmk_keymap_highest_layer_active() == cfg->scroll_layer) {
         int16_t original_val = evt->value;
         int16_t scaled_val = original_val;
@@ -223,10 +232,8 @@ static void filter_with_input_config(const struct input_listener_ps2_config *cfg
                 break;
         }
 
-        // 步骤4：最终赋值（分级后的值）
         evt->value = scaled_val;
     }
-
 }
 
 static void clear_xy_data(struct input_listener_ps2_xy_data *data) {
@@ -234,35 +241,41 @@ static void clear_xy_data(struct input_listener_ps2_xy_data *data) {
     data->mode = INPUT_LISTENER_XY_DATA_MODE_NONE;
 }
 
-// ========== 新增：空闲检查函数 ==========
+// 修正：空闲检查函数 - 增加防护逻辑
 static bool is_idle_timeout_reached(const struct input_listener_ps2_config *config,
                                    struct input_listener_ps2_data *data) {
-    int64_t now = k_uptime_get();
-    int64_t idle_time = now - data->layer_toggle_last_mouse_package_time;
-    return (idle_time > config->idle_sleep_threshold_ms) && !data->has_valid_input;
+    // 使用默认阈值（5秒）避免配置缺失问题
+    int threshold = config->idle_sleep_threshold_ms > 0 ?
+                    config->idle_sleep_threshold_ms : 5000;
+
+    // 初始化保护：前3秒不进入空闲
+    if (k_uptime_get() < 3000) {
+        return false;
+    }
+
+    int64_t idle_time = k_uptime_get() - data->layer_toggle_last_mouse_package_time;
+    bool idle = (idle_time > threshold) && !data->has_valid_input;
+
+    // 更新深度空闲状态
+    if (idle) {
+        data->is_deep_idle = true;
+    }
+
+    return data->is_deep_idle;
 }
 
 static void input_handler_ps2(const struct input_listener_ps2_config *config,
                               struct input_listener_ps2_data *data, struct input_event *evt) {
-    // ========== 新增：初始化有效输入标记 ==========
+    // 初始化有效输入标记
     data->has_valid_input = false;
 
     // First, filter to update the event data as needed.
     filter_with_input_config(config, evt);
 
-    LOG_DBG("Got input_handler_ps2 event: %s with value 0x%x", get_input_code_name(evt),
-            evt->value);
+    LOG_DBG("Got input_handler_ps2 event: %s with value 0x%x, idle: %d",
+            get_input_code_name(evt), evt->value, data->is_deep_idle);
 
-    // ========== 修改：仅当非空闲状态时处理layer_toggle ==========
-    if (!is_idle_timeout_reached(config, data)) {
-        zmk_input_listener_ps2_layer_toggle_input_rel_received(config, data);
-    } else {
-        // 空闲状态：取消所有待处理的延迟工作，减少定时器唤醒
-        k_work_cancel_delayable(&data->layer_toggle_activation_delay);
-        k_work_cancel_delayable(&data->layer_toggle_deactivation_delay);
-        return; // 直接返回，跳过后续无效处理
-    }
-
+    // 先处理事件，再判断空闲状态（关键修复）
     switch (evt->type) {
     case INPUT_EV_REL:
         handle_rel_code(data, evt);
@@ -275,10 +288,22 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
         break;
     }
 
+    // 更新最后活动时间（关键修复）
+    data->layer_toggle_last_mouse_package_time = k_uptime_get();
+
+    // 仅当非空闲状态时处理layer_toggle
+    if (!is_idle_timeout_reached(config, data)) {
+        zmk_input_listener_ps2_layer_toggle_input_rel_received(config, data);
+    } else {
+        // 空闲状态：取消所有待处理的延迟工作
+        k_work_cancel_delayable(&data->layer_toggle_activation_delay);
+        k_work_cancel_delayable(&data->layer_toggle_deactivation_delay);
+    }
+
     if (evt->sync) {
-        // ========== 修改：仅当有有效输入时处理同步逻辑 ==========
-        if (!data->has_valid_input) {
-            // 无有效输入：清空数据并返回，跳过HID报告发送
+        // 仅当有有效输入时处理同步逻辑
+        if (!data->has_valid_input && data->is_deep_idle) {
+            // 深度空闲且无有效输入：清空数据并返回
             clear_xy_data(&data->mouse.data);
             clear_xy_data(&data->mouse.wheel_data);
             data->mouse.button_set = data->mouse.button_clear = 0;
@@ -327,7 +352,7 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
         clear_xy_data(&data->mouse.wheel_data);
 
         data->mouse.button_set = data->mouse.button_clear = 0;
-        // ========== 新增：重置有效输入标记 ==========
+        // 重置有效输入标记
         data->has_valid_input = false;
     }
 }
@@ -338,14 +363,10 @@ void zmk_input_listener_ps2_layer_toggle_input_rel_received(
         return;
     }
 
-    data->layer_toggle_last_mouse_package_time = k_uptime_get();
-
     if (data->layer_toggle_layer_enabled == false) {
         k_work_schedule(&data->layer_toggle_activation_delay,
                         K_MSEC(config->layer_toggle_delay_ms));
     } else {
-        // Deactivate the layer if no further movement within
-        // layer_toggle_timeout_ms
         k_work_reschedule(&data->layer_toggle_deactivation_delay,
                           K_MSEC(config->layer_toggle_timeout_ms));
     }
@@ -361,19 +382,15 @@ void zmk_input_listener_ps2_layer_toggle_activate_layer(struct k_work *item) {
     int64_t current_time = k_uptime_get();
     int64_t last_mv_within_ms = current_time - data->layer_toggle_last_mouse_package_time;
 
-    // ========== 修改：放宽激活阈值，减少频繁激活 ==========
-    if (last_mv_within_ms <= config->layer_toggle_timeout_ms * 0.2) { // 从0.1改为0.2，减少误判
+    // 放宽激活阈值，减少频繁激活
+    if (last_mv_within_ms <= config->layer_toggle_timeout_ms * 0.2) {
         LOG_INF("Activating layer %d due to mouse activity...", config->layer_toggle);
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_ENABLE_UROB_COMPAT)
-
         zmk_keymap_layer_activate(config->layer_toggle, false);
-
 #else
-
         zmk_keymap_layer_activate(config->layer_toggle);
-
-#endif /* IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_ENABLE_UROB_COMPAT) */
+#endif
 
         data->layer_toggle_layer_enabled = true;
     } else {
@@ -404,8 +421,9 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                           zmk_input_listener_ps2_layer_toggle_activate_layer);
     k_work_init_delayable(&data->layer_toggle_deactivation_delay,
                           zmk_input_listener_ps2_layer_toggle_deactivate_layer);
-    // ========== 新增：初始化有效输入标记 ==========
     data->has_valid_input = false;
+    data->is_deep_idle = false; // 初始不进入深度空闲
+    data->layer_toggle_last_mouse_package_time = k_uptime_get(); // 初始化时间戳
 
     return 0;
 }
@@ -428,16 +446,16 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                             .scroll_layer = DT_INST_PROP(n, scroll_layer),                         \
                             .scroll_speed_num = DT_INST_PROP(n, scroll_speed_num),                 \
                             .scroll_speed_den = DT_INST_PROP(n, scroll_speed_den),                 \
-                            // ========== 新增：默认休眠阈值500ms ==========
-                            .idle_sleep_threshold_ms = DT_INST_PROP_OR(n, idle_sleep_threshold_ms, 500), \
+                            // 提供默认值（5秒）避免未配置时出错
+                            .idle_sleep_threshold_ms = DT_INST_PROP_OR(n, idle_sleep_threshold_ms, 5000), \
                         };                                                                         \
                     static struct input_listener_ps2_data data_##n =                               \
                         {                                                                          \
                             .dev = DEVICE_DT_INST_GET(n),                                          \
                             .layer_toggle_layer_enabled = false,                                   \
                             .layer_toggle_last_mouse_package_time = 0,                             \
-                            // ========== 新增：初始化休眠相关标记 ==========
                             .has_valid_input = false,                                              \
+                            .is_deep_idle = false,                                                 \
                             .last_scroll_report_time = 0,                                          \
                         };                                                                         \
                     void input_handler_ps2_##n(struct input_event *evt) {                          \

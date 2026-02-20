@@ -343,8 +343,8 @@ void zmk_mouse_ps2_update_activity_time();
 void zmk_mouse_ps2_activity_callback(const struct device *ps2_device, uint8_t byte) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
 
-    // Update activity time on any data reception for power management
-    zmk_mouse_ps2_update_activity_time();
+    // Don't update activity time here - only update when processing complete packets
+    // This prevents continuous data stream from preventing idle mode
     
     // Exit idle mode immediately when data is received
     if (data->is_idle_mode) {
@@ -734,7 +734,17 @@ void zmk_mouse_ps2_exit_idle_mode() {
 void zmk_mouse_ps2_idle_check_handler(struct k_work *work) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
     int64_t current_time = k_uptime_get();
-    int64_t time_since_last_activity = current_time - data->last_activity_time;
+    
+    // Handle initial case where last_activity_time is 0
+    int64_t time_since_last_activity;
+    if (data->last_activity_time == 0) {
+        // First check - use current time as baseline
+        data->last_activity_time = current_time;
+        time_since_last_activity = 0;
+        LOG_DBG("Initial idle check setup");
+    } else {
+        time_since_last_activity = current_time - data->last_activity_time;
+    }
     
     LOG_DBG("Idle check: time since last activity = %lld ms (threshold: %d ms)", 
             time_since_last_activity, MOUSE_PS2_IDLE_THRESHOLD_MS);
@@ -1842,7 +1852,7 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
     
     // Initialize power saving idle detection
     k_work_init_delayable(&data->idle_check_work, zmk_mouse_ps2_idle_check_handler);
-    data->last_activity_time = k_uptime_get();
+    data->last_activity_time = 0;  // Start with 0 to allow immediate idle detection
     
     // Start initial idle monitoring after system stabilization
     k_work_schedule(&data->idle_check_work, K_SECONDS(5));

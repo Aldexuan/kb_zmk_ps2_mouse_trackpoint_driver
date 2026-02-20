@@ -22,6 +22,10 @@ config ZMK_INPUT_MOUSE_PS2_POWER_ON_RESET_TIME
     help
       Refer to IBM TrackPoint System Version 4.0 Engineering Specification - Section 2.1
 
+config ZMK_INPUT_MOUSE_PS2_ENABLE_UROB_COMPAT
+    bool "Makes the driver compatible with urob's zmk fork. His fork has commits that change the default zmk function definitions. This option adopts the code to make it compatible with his changes. Only enable it if you are using his fork or it will fail to compile."
+	default n
+
 config ZMK_INPUT_MOUSE_PS2_IDLE_THRESHOLD_MS
     int "Time in milliseconds of inactivity before entering idle mode to save power"
     default 30000
@@ -30,10 +34,6 @@ config ZMK_INPUT_MOUSE_PS2_IDLE_THRESHOLD_MS
       Lower values save more power but may cause slight delays when resuming operation.
       Recommended values: 15000-60000 ms (15-60 seconds)
       Default: 30000 ms (30 seconds)
-
-config ZMK_INPUT_MOUSE_PS2_ENABLE_UROB_COMPAT
-    bool "Makes the driver compatible with urob's zmk fork. His fork has commits that change the default zmk function definitions. This option adopts the code to make it compatible with his changes. Only enable it if you are using his fork or it will fail to compile."
-	default n
 
 config ZMK_INPUT_MOUSE_PS2_ENABLE_ERROR_MITIGATION
     bool "Tries to mitigate transmission errors. Only useful when using a PS2 driver that is prone to miscommunication like the GPIO bitbanging driver."

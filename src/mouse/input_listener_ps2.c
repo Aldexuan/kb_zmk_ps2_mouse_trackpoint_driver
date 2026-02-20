@@ -243,16 +243,16 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
     }
 
     if (evt->sync) {
-        if (cfg->scroll_layer >=0 && zmk_keymap_highest_layer_active() == cfg->scroll_layer) {
+        if (config->scroll_layer >= 0 && zmk_keymap_highest_layer_active() == config->scroll_layer) {
             int64_t now = k_uptime_get();
-            if (now - data->last_scroll_report_time < 40) { // 40ms节流间隔
-                clear_xy_data(&data->mouse.wheel_data); // 清空本次数据
-                // 清空按键状态，避免残留
+            if (now - data->last_scroll_report_time < 40) {
+                clear_xy_data(&data->mouse.wheel_data);
                 data->mouse.button_set = data->mouse.button_clear = 0;
-                return; // 跳过上报
+                return;
             }
-            data->last_scroll_report_time = now; // 更新时间戳
+            data->last_scroll_report_time = now;
         }
+
         if (data->mouse.wheel_data.mode == INPUT_LISTENER_XY_DATA_MODE_REL) {
             zmk_hid_mouse_scroll_set(data->mouse.wheel_data.x, data->mouse.wheel_data.y);
         }

@@ -49,3 +49,8 @@ properties:
     default: 2
     required: false
     description: Denominator for scroll speed scaling factor (e.g., 10 for 1/10 speed, 20 for 1/20 speed)
+  idle-sleep-threshold-ms:
+    type: int
+    default: 1000
+    required: false
+    description: idle sleep

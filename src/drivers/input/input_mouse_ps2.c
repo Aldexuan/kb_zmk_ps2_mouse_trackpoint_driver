@@ -17,8 +17,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/util.h>
-#include <zmk/event_manager.h>
-#include <zmk/events/activity_state_changed.h>
+
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 /*
@@ -26,7 +25,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
  */
 
 // Delay mouse init to give the mouse time to send the init sequence.
-#define ZMK_MOUSE_PS2_INIT_THREAD_DELAY_MS 2000
+#define ZMK_MOUSE_PS2_INIT_THREAD_DELAY_MS 1000
 
 // How often the driver try to initialize a mouse before we give up.
 #define MOUSE_PS2_INIT_ATTEMPTS 10
@@ -90,7 +89,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define MOUSE_PS2_CMD_TP_SET_SENSITIVITY_RESP_LEN 0
 #define MOUSE_PS2_CMD_TP_SET_SENSITIVITY_MIN 0
 #define MOUSE_PS2_CMD_TP_SET_SENSITIVITY_MAX 255
-#define MOUSE_PS2_CMD_TP_SET_SENSITIVITY_DEFAULT 255
+#define MOUSE_PS2_CMD_TP_SET_SENSITIVITY_DEFAULT 128
 
 #define MOUSE_PS2_ST_TP_NEG_INERTIA "tp_neg_inertia"
 #define MOUSE_PS2_CMD_TP_GET_NEG_INERTIA "\xe2\x80\x4d"
@@ -110,7 +109,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define MOUSE_PS2_CMD_TP_SET_VALUE6_UPPER_PLATEAU_SPEED_RESP_LEN 0
 #define MOUSE_PS2_CMD_TP_SET_VALUE6_UPPER_PLATEAU_SPEED_MIN 0
 #define MOUSE_PS2_CMD_TP_SET_VALUE6_UPPER_PLATEAU_SPEED_MAX 255
-#define MOUSE_PS2_CMD_TP_SET_VALUE6_UPPER_PLATEAU_SPEED_DEFAULT 0x81
+#define MOUSE_PS2_CMD_TP_SET_VALUE6_UPPER_PLATEAU_SPEED_DEFAULT 0x61
 
 #define MOUSE_PS2_ST_TP_PTS_THRESHOLD "tp_pts_threshold"
 #define MOUSE_PS2_CMD_TP_GET_PTS_THRESHOLD "\xe2\x80\x5c"
@@ -120,7 +119,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define MOUSE_PS2_CMD_TP_SET_PTS_THRESHOLD_RESP_LEN 0
 #define MOUSE_PS2_CMD_TP_SET_PTS_THRESHOLD_MIN 0
 #define MOUSE_PS2_CMD_TP_SET_PTS_THRESHOLD_MAX 255
-#define MOUSE_PS2_CMD_TP_SET_PTS_THRESHOLD_DEFAULT 0x06
+#define MOUSE_PS2_CMD_TP_SET_PTS_THRESHOLD_DEFAULT 0x08
 
 // Trackpoint Config Bits
 #define MOUSE_PS2_TP_CONFIG_BIT_PRESS_TO_SELECT 0x00
@@ -316,28 +315,6 @@ zmk_mouse_ps2_activity_parse_packet_buffer(zmk_mouse_ps2_packet_mode packet_mode
                                            uint8_t packet_state, uint8_t packet_x, uint8_t packet_y,
                                            uint8_t packet_extra);
 void zmk_mouse_ps2_activity_toggle_layer();
-
-// Power saving stuff
-static int on_activity_state_changed(const zmk_event_t *eh) {
-    const struct zmk_activity_state_changed *ev = as_zmk_activity_state_changed(eh);
-
-    switch (ev->state) {
-    case ZMK_ACTIVITY_ACTIVE:
-        LOG_INF("Keyboard is sleeping, enablding PS2 reporting");
-        zmk_mouse_ps2_activity_reporting_enable();
-        break;
-    case ZMK_ACTIVITY_IDLE:
-    case ZMK_ACTIVITY_SLEEP:
-        LOG_INF("Keyboard is sleeping, disabling PS2 reporting");
-        zmk_mouse_ps2_activity_reporting_disable();
-        break;
-    }
-
-    return 0;
-}
-
-ZMK_LISTENER(my_driver, on_activity_state_changed);
-ZMK_SUBSCRIPTION(my_driver, zmk_activity_state_changed);
 
 // Called by the PS/2 driver whenver the mouse sends a byte and
 // reporting is enabled through `zmk_mouse_ps2_activity_reporting_enable`.
@@ -1694,43 +1671,16 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
         if (config->tp_sensitivity != -1) {
             LOG_INF("Setting TP sensitivity to %d...", config->tp_sensitivity);
             zmk_mouse_ps2_tp_sensitivity_set(config->tp_sensitivity);
-            uint8_t actual_sensitivity;
-            if (zmk_mouse_ps2_tp_sensitivity_get(&actual_sensitivity) == 0) {
-                if (actual_sensitivity != config->tp_sensitivity) {
-                    LOG_WRN("TP sensitivity readback mismatch: expected %d, got %d. Retrying...",
-                            config->tp_sensitivity, actual_sensitivity);
-                    k_msleep(100);
-                    zmk_mouse_ps2_tp_sensitivity_set(config->tp_sensitivity);
-                }
-            }
         }
 
         if (config->tp_neg_inertia != -1) {
             LOG_INF("Setting TP inertia to %d...", config->tp_neg_inertia);
             zmk_mouse_ps2_tp_neg_inertia_set(config->tp_neg_inertia);
-            uint8_t actual_neg_inertia;
-            if (zmk_mouse_ps2_tp_negative_inertia_get(&actual_neg_inertia) == 0) {
-                if (actual_neg_inertia != config->tp_neg_inertia) {
-                    LOG_WRN("TP neg inertia readback mismatch: expected %d, got %d. Retrying...",
-                            config->tp_neg_inertia, actual_neg_inertia);
-                    k_msleep(100);
-                    zmk_mouse_ps2_tp_neg_inertia_set(config->tp_neg_inertia);
-                }
-            }
         }
 
         if (config->tp_val6_upper_speed != -1) {
             LOG_INF("Setting TP value 6 upper speed plateau to %d...", config->tp_val6_upper_speed);
             zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(config->tp_val6_upper_speed);
-            uint8_t actual_val6;
-            if (zmk_mouse_ps2_tp_value6_upper_plateau_speed_get(&actual_val6) == 0) {
-                if (actual_val6 != config->tp_val6_upper_speed) {
-                    LOG_WRN("TP value6 readback mismatch: expected %d, got %d. Retrying...",
-                            config->tp_val6_upper_speed, actual_val6);
-                    k_msleep(100);
-                    zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(config->tp_val6_upper_speed);
-                }
-            }
         }
         if (config->tp_x_invert) {
             LOG_INF("Inverting trackpoint x axis.");

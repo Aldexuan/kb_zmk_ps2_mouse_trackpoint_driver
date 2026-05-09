@@ -463,9 +463,17 @@ void zmk_mouse_ps2_activity_process_cmd(zmk_mouse_ps2_packet_mode packet_mode, u
 
     // Safety check: If movement is unreasonably large, it's likely a desync artifact
     if (abs(packet.mov_x) > 60 || abs(packet.mov_y) > 60) {
-        LOG_WRN("Detected abnormal drift (x=%d, y=%d), resetting packet buffer.", 
+        LOG_WRN("Detected abnormal drift (x=%d, y=%d), forcing resync.", 
                 packet.mov_x, packet.mov_y);
-        zmk_mouse_ps2_activity_abort_cmd("Abnormal drift detected");
+        
+        // Force reset the packet buffer to regain synchronization
+        data->packet_idx = 0;
+        memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
+        
+        // Optionally send a resend command to the device
+        const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
+        ps2_write(config->ps2_device, 0xFE); // RESEND command
+        
         return;
     }
 
@@ -789,6 +797,12 @@ int zmk_mouse_ps2_activity_reporting_enable() {
     }
 
     data->activity_reporting_on = true;
+
+    // CRITICAL: Clear buffer AFTER enabling reporting to discard any "race condition" packets
+    // that arrived while the system was still booting/connecting.
+    data->packet_idx = 0;
+    memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
+    data->wake_up_packets_to_discard = 20; // Discard ~200ms of initial noise
 
     return 0;
 }

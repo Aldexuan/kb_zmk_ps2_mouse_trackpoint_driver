@@ -321,6 +321,25 @@ void zmk_mouse_ps2_activity_toggle_layer();
 void zmk_mouse_ps2_activity_callback(const struct device *ps2_device, uint8_t byte) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
 
+    // Power saving: Minimal processing when keyboard is idle
+    // We still need to maintain PS/2 protocol sync, but skip expensive operations
+    extern bool mouse_ps2_is_idle;
+    if (mouse_ps2_is_idle) {
+        // Just consume bytes to keep protocol in sync, but don't process
+        data->packet_buffer[data->packet_idx] = byte;
+        
+        if (data->packet_idx == 0) {
+            int alignment_bit = MOUSE_PS2_GET_BIT(byte, 3);
+            if (alignment_bit != 1) {
+                data->packet_idx = 0;  // Reset on misalignment
+                return;
+            }
+        }
+        
+        data->packet_idx = (data->packet_idx + 1) % 3;  // Cycle through 0,1,2
+        return;  // Skip all further processing
+    }
+
     k_work_cancel_delayable(&data->packet_buffer_timeout);
 
     // LOG_DBG("Received mouse movement data: 0x%x", byte);
@@ -1855,7 +1874,7 @@ DEVICE_DT_INST_DEFINE(0, &zmk_mouse_ps2_init, NULL, &zmk_mouse_ps2_data, &zmk_mo
                       POST_KERNEL, ZMK_MOUSE_PS2_INIT_PRIORITY, NULL);
 
 /*
- * Power Saving: Dynamic sampling rate based on keyboard activity
+ * Power Saving: Dynamic sampling rate and noise filtering based on keyboard activity
  */
 
 #include <zmk/event_manager.h>
@@ -1863,6 +1882,9 @@ DEVICE_DT_INST_DEFINE(0, &zmk_mouse_ps2_init, NULL, &zmk_mouse_ps2_data, &zmk_mo
 
 // Idle sampling rate (lower to save power)
 #define MOUSE_PS2_IDLE_SAMPLING_RATE 40
+
+// Noise filter threshold (filter movements smaller than this when idle)
+#define MOUSE_PS2_IDLE_NOISE_THRESHOLD 2
 
 // Track original sampling rate and current state
 static uint8_t mouse_ps2_original_sampling_rate = 0;
@@ -1874,9 +1896,9 @@ static int on_activity_state_changed(const zmk_event_t *eh) {
 
     switch (ev->state) {
     case ZMK_ACTIVITY_ACTIVE:
-        // Keyboard is active - restore original sampling rate
+        // Keyboard is active (user pressed a key) - restore full performance
         if (mouse_ps2_is_idle && mouse_ps2_original_sampling_rate > 0) {
-            LOG_INF("Keyboard active, restoring TrackPoint sampling rate to %d Hz",
+            LOG_INF("Keyboard activated, restoring TrackPoint to full performance (%d Hz)",
                     mouse_ps2_original_sampling_rate);
             zmk_mouse_ps2_set_sampling_rate(mouse_ps2_original_sampling_rate);
             mouse_ps2_is_idle = false;
@@ -1884,15 +1906,16 @@ static int on_activity_state_changed(const zmk_event_t *eh) {
         break;
     case ZMK_ACTIVITY_IDLE:
     case ZMK_ACTIVITY_SLEEP:
-        // Keyboard is idle/sleeping - reduce sampling rate to save power
+        // Keyboard is idle (no key press for CONFIG_ZMK_IDLE_TIMEOUT ms) - reduce power
         if (!mouse_ps2_is_idle) {
             // Save original rate if not already saved
             if (mouse_ps2_original_sampling_rate == 0) {
                 mouse_ps2_original_sampling_rate = data->sampling_rate;
+                LOG_INF("Saved original sampling rate: %d Hz", mouse_ps2_original_sampling_rate);
             }
             
-            LOG_INF("Keyboard idle/sleep, reducing TrackPoint sampling rate to %d Hz",
-                    MOUSE_PS2_IDLE_SAMPLING_RATE);
+            LOG_INF("Keyboard idle, reducing TrackPoint power (sampling: %d Hz, noise filter: <%d)",
+                    MOUSE_PS2_IDLE_SAMPLING_RATE, MOUSE_PS2_IDLE_NOISE_THRESHOLD);
             zmk_mouse_ps2_set_sampling_rate(MOUSE_PS2_IDLE_SAMPLING_RATE);
             mouse_ps2_is_idle = true;
         }

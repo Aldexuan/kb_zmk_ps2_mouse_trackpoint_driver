@@ -1898,27 +1898,58 @@ static int on_activity_state_changed(const zmk_event_t *eh) {
 
     switch (ev->state) {
     case ZMK_ACTIVITY_ACTIVE:
-        // Keyboard is active (user pressed a key) - restore full performance
-        if (mouse_ps2_is_idle && mouse_ps2_original_sampling_rate > 0) {
-            LOG_INF("Keyboard activated, restoring TrackPoint to full performance (%d Hz)",
-                    mouse_ps2_original_sampling_rate);
-            zmk_mouse_ps2_set_sampling_rate(mouse_ps2_original_sampling_rate);
+        // Keyboard is active - Restore power and re-initialize TrackPoint
+        if (mouse_ps2_is_idle) {
+            LOG_INF("Keyboard activated, restoring TrackPoint VCC...");
+            
+            // 1. Enable VCC via ext_power
+            const struct device *ext_power_dev = device_get_binding("EXT_POWER");
+            if (ext_power_dev) {
+                ext_power_enable(ext_power_dev);
+            }
+
+            // 2. CRITICAL: Wait for TrackPoint POR (Power-On Reset) time
+            // According to spec, TrackPoint needs ~600ms to stabilize after power-up
+            LOG_INF("Waiting 600ms for TrackPoint POR sequence...");
+            k_sleep(K_MSEC(600));
+
+            // 3. Re-initialize the PS/2 interface
+            LOG_INF("Re-initializing TrackPoint...");
+            const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
+            
+            // Reset the device to ensure clean state
+            zmk_mouse_ps2_reset(config->ps2_device);
+            k_sleep(K_MSEC(50)); // Small delay after reset
+
+            // Enable data reporting
+            ps2_write(config->ps2_device, 0xF4);
+            k_sleep(K_MSEC(10));
+
+            // Restore original sampling rate
+            if (mouse_ps2_original_sampling_rate > 0) {
+                zmk_mouse_ps2_set_sampling_rate(mouse_ps2_original_sampling_rate);
+            }
+
             mouse_ps2_is_idle = false;
+            LOG_INF("TrackPoint successfully woken up.");
         }
         break;
     case ZMK_ACTIVITY_IDLE:
     case ZMK_ACTIVITY_SLEEP:
-        // Keyboard is idle (no key press for CONFIG_ZMK_IDLE_TIMEOUT ms) - reduce power
+        // Keyboard is idle - Cut off VCC to save maximum power
         if (!mouse_ps2_is_idle) {
-            // Save original rate if not already saved
-            if (mouse_ps2_original_sampling_rate == 0) {
-                mouse_ps2_original_sampling_rate = data->sampling_rate;
-                LOG_INF("Saved original sampling rate: %d Hz", mouse_ps2_original_sampling_rate);
+            LOG_INF("Keyboard idle, cutting off TrackPoint VCC...");
+            
+            const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
+            // Optional: Send disable command before cutting power (good practice)
+            ps2_write(config->ps2_device, 0xF5);
+            k_sleep(K_MSEC(10));
+
+            const struct device *ext_power_dev = device_get_binding("EXT_POWER");
+            if (ext_power_dev) {
+                ext_power_disable(ext_power_dev);
             }
             
-            LOG_INF("Keyboard idle, reducing TrackPoint power (sampling: %d Hz, noise filter: <%d)",
-                    MOUSE_PS2_IDLE_SAMPLING_RATE, MOUSE_PS2_IDLE_NOISE_THRESHOLD);
-            zmk_mouse_ps2_set_sampling_rate(MOUSE_PS2_IDLE_SAMPLING_RATE);
             mouse_ps2_is_idle = true;
         }
         break;

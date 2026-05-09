@@ -2,14 +2,10 @@ description: External power control behavior for TrackPoint power management
 
 compatible: "zmk,behavior-ext-power-control"
 
-include: [behavior.yaml]
+include: base.yaml
 
 properties:
   label:
     type: string
     required: true
     description: Human readable label for the behavior
-  #binding-cells:
-  #  type: int
-  #  const: 1
-  #  description: Number of cells in the binding (must be 1 for parameter)

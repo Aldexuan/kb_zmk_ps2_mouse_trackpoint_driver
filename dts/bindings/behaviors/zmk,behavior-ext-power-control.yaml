@@ -3,9 +3,3 @@ description: External power control behavior for TrackPoint power management
 compatible: "zmk,behavior-ext-power-control"
 
 include: base.yaml
-
-properties:
-  label:
-    type: string
-    required: true
-    description: Human readable label for the behavior

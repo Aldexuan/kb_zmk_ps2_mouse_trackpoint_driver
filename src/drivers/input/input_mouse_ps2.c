@@ -23,6 +23,10 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 // Forward declaration for power saving variable (defined at the end of this file)
 static bool mouse_ps2_is_idle;
 
+#ifdef CONFIG_ZMK_EXT_POWER
+#include <zmk/ext_power.h>
+#endif
+
 /*
  * Settings
  */
@@ -1902,14 +1906,14 @@ static int on_activity_state_changed(const zmk_event_t *eh) {
         if (mouse_ps2_is_idle) {
             LOG_INF("Keyboard activated, restoring TrackPoint VCC...");
             
-            // 1. Enable VCC via ext_power
-            const struct device *ext_power_dev = device_get_binding("EXT_POWER");
-            if (ext_power_dev) {
-                ext_power_enable(ext_power_dev);
-            }
+#ifdef CONFIG_ZMK_EXT_POWER
+            zmk_ext_power_enable();
+#else
+            LOG_WRN("CONFIG_ZMK_EXT_POWER is not enabled, skipping VCC restore.");
+#endif
+            k_sleep(K_MSEC(50)); // Allow voltage to stabilize
 
             // 2. CRITICAL: Wait for TrackPoint POR (Power-On Reset) time
-            // According to spec, TrackPoint needs ~600ms to stabilize after power-up
             LOG_INF("Waiting 600ms for TrackPoint POR sequence...");
             k_sleep(K_MSEC(600));
 
@@ -1919,7 +1923,7 @@ static int on_activity_state_changed(const zmk_event_t *eh) {
             
             // Reset the device to ensure clean state
             zmk_mouse_ps2_reset(config->ps2_device);
-            k_sleep(K_MSEC(50)); // Small delay after reset
+            k_sleep(K_MSEC(50));
 
             // Enable data reporting
             ps2_write(config->ps2_device, 0xF4);
@@ -1941,14 +1945,15 @@ static int on_activity_state_changed(const zmk_event_t *eh) {
             LOG_INF("Keyboard idle, cutting off TrackPoint VCC...");
             
             const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
-            // Optional: Send disable command before cutting power (good practice)
+            // Send disable command before cutting power
             ps2_write(config->ps2_device, 0xF5);
             k_sleep(K_MSEC(10));
 
-            const struct device *ext_power_dev = device_get_binding("EXT_POWER");
-            if (ext_power_dev) {
-                ext_power_disable(ext_power_dev);
-            }
+#ifdef CONFIG_ZMK_EXT_POWER
+            zmk_ext_power_disable();
+#else
+            LOG_WRN("CONFIG_ZMK_EXT_POWER is not enabled, skipping VCC cut-off.");
+#endif
             
             mouse_ps2_is_idle = true;
         }

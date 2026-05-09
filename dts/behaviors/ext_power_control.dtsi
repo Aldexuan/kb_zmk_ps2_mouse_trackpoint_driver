@@ -1,0 +1,15 @@
+/*
+ * Copyright (c) 2024 The ZMK Contributors
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+/ {
+	behaviors {
+		ext_power_ctrl: behavior_ext_power_control {
+			compatible = "zmk,behavior-ext-power-control";
+			display-name = "TrackPoint Power Control";
+			#binding-cells = <1>;
+		};
+	};
+};

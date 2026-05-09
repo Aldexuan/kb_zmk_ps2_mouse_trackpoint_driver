@@ -12,13 +12,3 @@ DT_COMPAT_ZMK_BEHAVIOR_MOUSE_SETTING := zmk,behavior-mouse-setting
 config ZMK_BEHAVIOR_MOUSE_SETTING
         bool
         default ZMK_INPUT_MOUSE_PS2 && $(dt_compat_enabled,$(DT_COMPAT_ZMK_BEHAVIOR_MOUSE_SETTING))
-
-DT_COMPAT_ZMK_BEHAVIOR_EXT_POWER_CONTROL := zmk,behavior-ext-power-control
-config ZMK_BEHAVIOR_EXT_POWER_CONTROL
-        bool "Auto-control TrackPoint power based on keyboard activity"
-        default ZMK_INPUT_MOUSE_PS2 && $(dt_compat_enabled,$(DT_COMPAT_ZMK_BEHAVIOR_EXT_POWER_CONTROL))
-        depends on EXT_POWER
-        help
-          Automatically enable/disable TrackPoint power based on keyboard activity state.
-          When keyboard is idle or sleeping, TrackPoint power is disabled to save battery.
-          When keyboard becomes active again, TrackPoint power is automatically re-enabled.

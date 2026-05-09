@@ -1853,3 +1853,54 @@ int zmk_mouse_ps2_init_wait_for_mouse(const struct device *dev) {
 
 DEVICE_DT_INST_DEFINE(0, &zmk_mouse_ps2_init, NULL, &zmk_mouse_ps2_data, &zmk_mouse_ps2_config,
                       POST_KERNEL, ZMK_MOUSE_PS2_INIT_PRIORITY, NULL);
+
+/*
+ * Power Saving: Dynamic sampling rate based on keyboard activity
+ */
+
+#include <zmk/event_manager.h>
+#include <zmk/events/activity_state_changed.h>
+
+// Idle sampling rate (lower to save power)
+#define MOUSE_PS2_IDLE_SAMPLING_RATE 40
+
+// Track original sampling rate and current state
+static uint8_t mouse_ps2_original_sampling_rate = 0;
+static bool mouse_ps2_is_idle = false;
+
+static int on_activity_state_changed(const zmk_event_t *eh) {
+    const struct zmk_activity_state_changed *ev = as_zmk_activity_state_changed(eh);
+    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+
+    switch (ev->state) {
+    case ZMK_ACTIVITY_ACTIVE:
+        // Keyboard is active - restore original sampling rate
+        if (mouse_ps2_is_idle && mouse_ps2_original_sampling_rate > 0) {
+            LOG_INF("Keyboard active, restoring TrackPoint sampling rate to %d Hz",
+                    mouse_ps2_original_sampling_rate);
+            zmk_mouse_ps2_set_sampling_rate(mouse_ps2_original_sampling_rate);
+            mouse_ps2_is_idle = false;
+        }
+        break;
+    case ZMK_ACTIVITY_IDLE:
+    case ZMK_ACTIVITY_SLEEP:
+        // Keyboard is idle/sleeping - reduce sampling rate to save power
+        if (!mouse_ps2_is_idle) {
+            // Save original rate if not already saved
+            if (mouse_ps2_original_sampling_rate == 0) {
+                mouse_ps2_original_sampling_rate = data->sampling_rate;
+            }
+            
+            LOG_INF("Keyboard idle/sleep, reducing TrackPoint sampling rate to %d Hz",
+                    MOUSE_PS2_IDLE_SAMPLING_RATE);
+            zmk_mouse_ps2_set_sampling_rate(MOUSE_PS2_IDLE_SAMPLING_RATE);
+            mouse_ps2_is_idle = true;
+        }
+        break;
+    }
+
+    return 0;
+}
+
+ZMK_LISTENER(mouse_ps2_power_save, on_activity_state_changed);
+ZMK_SUBSCRIPTION(mouse_ps2_power_save, zmk_activity_state_changed);

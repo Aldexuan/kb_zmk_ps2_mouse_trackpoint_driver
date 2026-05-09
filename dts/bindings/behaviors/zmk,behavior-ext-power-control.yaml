@@ -1,5 +1,0 @@
-description: External power control behavior for TrackPoint power management
-
-compatible: "zmk,behavior-ext-power-control"
-
-include: base.yaml

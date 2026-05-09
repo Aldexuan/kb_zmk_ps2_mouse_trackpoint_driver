@@ -20,6 +20,9 @@
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
+// Forward declaration for power saving module variable
+extern bool mouse_ps2_is_idle;
+
 /*
  * Settings
  */
@@ -323,7 +326,6 @@ void zmk_mouse_ps2_activity_callback(const struct device *ps2_device, uint8_t by
 
     // Power saving: Minimal processing when keyboard is idle
     // We still need to maintain PS/2 protocol sync, but skip expensive operations
-    extern bool mouse_ps2_is_idle;
     if (mouse_ps2_is_idle) {
         // Just consume bytes to keep protocol in sync, but don't process
         data->packet_buffer[data->packet_idx] = byte;

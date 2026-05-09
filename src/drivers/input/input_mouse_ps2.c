@@ -17,15 +17,20 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/drivers/gpio.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 // Forward declaration for power saving variable (defined at the end of this file)
 static bool mouse_ps2_is_idle;
 
-#ifdef CONFIG_ZMK_EXT_POWER
-#include <zmk/ext_power.h>
-#endif
+// Define the GPIO used for TrackPoint VCC control
+// Hardware: P0.13, Active Low (Low = Power Off)
+static const struct gpio_dt_spec trackpoint_vcc_gpio = {
+    .port = DEVICE_DT_GET(DT_NODELABEL(gpio0)),
+    .pin = 13,
+    .dt_flags = GPIO_ACTIVE_LOW
+};
 
 /*
  * Settings
@@ -433,6 +438,43 @@ void zmk_mouse_ps2_activity_reset_packet_buffer() {
 void zmk_mouse_ps2_activity_process_cmd(zmk_mouse_ps2_packet_mode packet_mode, uint8_t packet_state,
                                         uint8_t packet_x, uint8_t packet_y, uint8_t packet_extra) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+
+    // If we are idle and receive data, it means the user is moving the mouse.
+    // We must immediately restore power and re-initialize.
+    if (mouse_ps2_is_idle) {
+        LOG_INF("TrackPoint movement detected while idle, restoring VCC...");
+        
+        // 1. Restore Power
+        gpio_pin_set_dt(&trackpoint_vcc_gpio, 0); // High level to enable power
+        k_sleep(K_MSEC(50));
+        
+        // 2. Wait for POR (Power-On Reset)
+        LOG_INF("Waiting 600ms for TrackPoint POR...");
+        k_sleep(K_MSEC(600));
+        
+        // 3. Hard Reset Sequence
+        const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
+        LOG_INF("Sending Reset command (0xFF)...");
+        zmk_mouse_ps2_reset(config->ps2_device);
+        
+        // Wait for the device to respond with AA (Self-test passed)
+        // In a real driver, we'd read the response, but for now we wait for stability
+        k_sleep(K_MSEC(100));
+        
+        // 4. Enable Data Reporting
+        LOG_INF("Enabling data reporting (0xF4)...");
+        ps2_write(config->ps2_device, 0xF4);
+        k_sleep(K_MSEC(20));
+        
+        // 5. Restore Configuration
+        if (mouse_ps2_original_sampling_rate > 0) {
+            zmk_mouse_ps2_set_sampling_rate(mouse_ps2_original_sampling_rate);
+        }
+        
+        mouse_ps2_is_idle = false;
+        LOG_INF("TrackPoint fully restored and ready.");
+    }
+
     struct zmk_mouse_ps2_packet packet;
     packet = zmk_mouse_ps2_activity_parse_packet_buffer(packet_mode, packet_state, packet_x,
                                                         packet_y, packet_extra);
@@ -1906,11 +1948,8 @@ static int on_activity_state_changed(const zmk_event_t *eh) {
         if (mouse_ps2_is_idle) {
             LOG_INF("Keyboard activated, restoring TrackPoint VCC...");
             
-#ifdef CONFIG_ZMK_EXT_POWER
-            zmk_ext_power_enable();
-#else
-            LOG_WRN("CONFIG_ZMK_EXT_POWER is not enabled, skipping VCC restore.");
-#endif
+            // Set to 0 (High physical level) to enable power for Active Low config
+            gpio_pin_set_dt(&trackpoint_vcc_gpio, 0);
             k_sleep(K_MSEC(50)); // Allow voltage to stabilize
 
             // 2. CRITICAL: Wait for TrackPoint POR (Power-On Reset) time
@@ -1949,11 +1988,8 @@ static int on_activity_state_changed(const zmk_event_t *eh) {
             ps2_write(config->ps2_device, 0xF5);
             k_sleep(K_MSEC(10));
 
-#ifdef CONFIG_ZMK_EXT_POWER
-            zmk_ext_power_disable();
-#else
-            LOG_WRN("CONFIG_ZMK_EXT_POWER is not enabled, skipping VCC cut-off.");
-#endif
+            // Set to 1 (Low physical level) to disable power for Active Low config
+            gpio_pin_set_dt(&trackpoint_vcc_gpio, 1);
             
             mouse_ps2_is_idle = true;
         }

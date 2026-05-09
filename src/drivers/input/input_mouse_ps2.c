@@ -17,21 +17,8 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/util.h>
-#include <zephyr/drivers/gpio.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
-
-// Forward declaration for power saving variable (defined at the end of this file)
-static bool mouse_ps2_is_idle;
-static uint8_t mouse_ps2_original_sampling_rate;
-
-// Define the GPIO used for TrackPoint VCC control
-// Hardware: P0.13, Active Low (Low = Power Off)
-static const struct gpio_dt_spec trackpoint_vcc_gpio = {
-    .port = DEVICE_DT_GET(DT_NODELABEL(gpio0)),
-    .pin = 13,
-    .dt_flags = GPIO_ACTIVE_LOW
-};
 
 /*
  * Settings
@@ -334,24 +321,6 @@ void zmk_mouse_ps2_activity_toggle_layer();
 void zmk_mouse_ps2_activity_callback(const struct device *ps2_device, uint8_t byte) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
 
-    // Power saving: Minimal processing when keyboard is idle
-    // We still need to maintain PS/2 protocol sync, but skip expensive operations
-    if (mouse_ps2_is_idle) {
-        // Just consume bytes to keep protocol in sync, but don't process
-        data->packet_buffer[data->packet_idx] = byte;
-        
-        if (data->packet_idx == 0) {
-            int alignment_bit = MOUSE_PS2_GET_BIT(byte, 3);
-            if (alignment_bit != 1) {
-                data->packet_idx = 0;  // Reset on misalignment
-                return;
-            }
-        }
-        
-        data->packet_idx = (data->packet_idx + 1) % 3;  // Cycle through 0,1,2
-        return;  // Skip all further processing
-    }
-
     k_work_cancel_delayable(&data->packet_buffer_timeout);
 
     // LOG_DBG("Received mouse movement data: 0x%x", byte);
@@ -439,43 +408,6 @@ void zmk_mouse_ps2_activity_reset_packet_buffer() {
 void zmk_mouse_ps2_activity_process_cmd(zmk_mouse_ps2_packet_mode packet_mode, uint8_t packet_state,
                                         uint8_t packet_x, uint8_t packet_y, uint8_t packet_extra) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
-
-    // If we are idle and receive data, it means the user is moving the mouse.
-    // We must immediately restore power and re-initialize.
-    if (mouse_ps2_is_idle) {
-        LOG_INF("TrackPoint movement detected while idle, restoring VCC...");
-        
-        // 1. Restore Power
-        gpio_pin_set_dt(&trackpoint_vcc_gpio, 0); // High level to enable power
-        k_sleep(K_MSEC(50));
-        
-        // 2. Wait for POR (Power-On Reset)
-        LOG_INF("Waiting 600ms for TrackPoint POR...");
-        k_sleep(K_MSEC(600));
-        
-        // 3. Hard Reset Sequence
-        const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
-        LOG_INF("Sending Reset command (0xFF)...");
-        ps2_write(config->ps2_device, 0xFF); // Send Reset command directly
-        
-        // Wait for the device to respond with AA (Self-test passed)
-        // In a real driver, we'd read the response, but for now we wait for stability
-        k_sleep(K_MSEC(100));
-        
-        // 4. Enable Data Reporting
-        LOG_INF("Enabling data reporting (0xF4)...");
-        ps2_write(config->ps2_device, 0xF4);
-        k_sleep(K_MSEC(20));
-        
-        // 5. Restore Configuration
-        if (mouse_ps2_original_sampling_rate > 0) {
-            zmk_mouse_ps2_set_sampling_rate(mouse_ps2_original_sampling_rate);
-        }
-        
-        mouse_ps2_is_idle = false;
-        LOG_INF("TrackPoint fully restored and ready.");
-    }
-
     struct zmk_mouse_ps2_packet packet;
     packet = zmk_mouse_ps2_activity_parse_packet_buffer(packet_mode, packet_state, packet_x,
                                                         packet_y, packet_extra);
@@ -1921,84 +1853,3 @@ int zmk_mouse_ps2_init_wait_for_mouse(const struct device *dev) {
 
 DEVICE_DT_INST_DEFINE(0, &zmk_mouse_ps2_init, NULL, &zmk_mouse_ps2_data, &zmk_mouse_ps2_config,
                       POST_KERNEL, ZMK_MOUSE_PS2_INIT_PRIORITY, NULL);
-
-/*
- * Power Saving: Dynamic sampling rate and noise filtering based on keyboard activity
- */
-
-#include <zmk/event_manager.h>
-#include <zmk/events/activity_state_changed.h>
-
-// Idle sampling rate (lower to save power)
-#define MOUSE_PS2_IDLE_SAMPLING_RATE 40
-
-// Noise filter threshold (filter movements smaller than this when idle)
-#define MOUSE_PS2_IDLE_NOISE_THRESHOLD 2
-
-// Track original sampling rate and current state
-static uint8_t mouse_ps2_original_sampling_rate = 0;
-static bool mouse_ps2_is_idle = false;
-
-static int on_activity_state_changed(const zmk_event_t *eh) {
-    const struct zmk_activity_state_changed *ev = as_zmk_activity_state_changed(eh);
-    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
-
-    switch (ev->state) {
-    case ZMK_ACTIVITY_ACTIVE:
-        // Keyboard is active - Restore power and re-initialize TrackPoint
-        if (mouse_ps2_is_idle) {
-            LOG_INF("Keyboard activated, restoring TrackPoint VCC...");
-            
-            // Set to 0 (High physical level) to enable power for Active Low config
-            gpio_pin_set_dt(&trackpoint_vcc_gpio, 0);
-            k_sleep(K_MSEC(50)); // Allow voltage to stabilize
-
-            // 2. CRITICAL: Wait for TrackPoint POR (Power-On Reset) time
-            LOG_INF("Waiting 600ms for TrackPoint POR sequence...");
-            k_sleep(K_MSEC(600));
-
-            // 3. Re-initialize the PS/2 interface
-            LOG_INF("Re-initializing TrackPoint...");
-            const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
-            
-            // Reset the device to ensure clean state
-            zmk_mouse_ps2_reset(config->ps2_device);
-            k_sleep(K_MSEC(50));
-
-            // Enable data reporting
-            ps2_write(config->ps2_device, 0xF4);
-            k_sleep(K_MSEC(10));
-
-            // Restore original sampling rate
-            if (mouse_ps2_original_sampling_rate > 0) {
-                zmk_mouse_ps2_set_sampling_rate(mouse_ps2_original_sampling_rate);
-            }
-
-            mouse_ps2_is_idle = false;
-            LOG_INF("TrackPoint successfully woken up.");
-        }
-        break;
-    case ZMK_ACTIVITY_IDLE:
-    case ZMK_ACTIVITY_SLEEP:
-        // Keyboard is idle - Cut off VCC to save maximum power
-        if (!mouse_ps2_is_idle) {
-            LOG_INF("Keyboard idle, cutting off TrackPoint VCC...");
-            
-            const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
-            // Send disable command before cutting power
-            ps2_write(config->ps2_device, 0xF5);
-            k_sleep(K_MSEC(10));
-
-            // Set to 1 (Low physical level) to disable power for Active Low config
-            gpio_pin_set_dt(&trackpoint_vcc_gpio, 1);
-            
-            mouse_ps2_is_idle = true;
-        }
-        break;
-    }
-
-    return 0;
-}
-
-ZMK_LISTENER(mouse_ps2_power_save, on_activity_state_changed);
-ZMK_SUBSCRIPTION(mouse_ps2_power_save, zmk_activity_state_changed);

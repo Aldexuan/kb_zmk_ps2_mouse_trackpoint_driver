@@ -20,9 +20,6 @@
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
-// Forward declaration for power saving module variable
-extern bool mouse_ps2_is_idle;
-
 /*
  * Settings
  */

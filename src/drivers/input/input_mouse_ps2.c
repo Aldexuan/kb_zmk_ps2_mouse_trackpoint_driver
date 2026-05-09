@@ -215,6 +215,9 @@ struct zmk_mouse_ps2_data {
     uint8_t tp_neg_inertia;
     uint8_t tp_value6;
     uint8_t tp_pts_threshold;
+
+    // Power saving: Track wake-up packets to discard initial drift
+    uint8_t wake_up_packets_to_discard;
 };
 
 static const struct zmk_mouse_ps2_config zmk_mouse_ps2_config = {
@@ -408,6 +411,14 @@ void zmk_mouse_ps2_activity_reset_packet_buffer() {
 void zmk_mouse_ps2_activity_process_cmd(zmk_mouse_ps2_packet_mode packet_mode, uint8_t packet_state,
                                         uint8_t packet_x, uint8_t packet_y, uint8_t packet_extra) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+
+    // Discard initial packets after wake-up to avoid drift/desync
+    if (data->wake_up_packets_to_discard > 0) {
+        data->wake_up_packets_to_discard--;
+        LOG_DBG("Discarding wake-up packet (%d remaining)", data->wake_up_packets_to_discard);
+        return;
+    }
+
     struct zmk_mouse_ps2_packet packet;
     packet = zmk_mouse_ps2_activity_parse_packet_buffer(packet_mode, packet_state, packet_x,
                                                         packet_y, packet_extra);
@@ -449,6 +460,14 @@ void zmk_mouse_ps2_activity_process_cmd(zmk_mouse_ps2_packet_mode packet_mode, u
 
     zmk_mouse_ps2_activity_move_mouse(packet.mov_x, packet.mov_y);
     zmk_mouse_ps2_activity_click_buttons(packet.button_l, packet.button_m, packet.button_r);
+
+    // Safety check: If movement is unreasonably large, it's likely a desync artifact
+    if (abs(packet.mov_x) > 60 || abs(packet.mov_y) > 60) {
+        LOG_WRN("Detected abnormal drift (x=%d, y=%d), resetting packet buffer.", 
+                packet.mov_x, packet.mov_y);
+        zmk_mouse_ps2_activity_abort_cmd("Abnormal drift detected");
+        return;
+    }
 
     data->prev_packet = packet;
 }
@@ -1785,6 +1804,14 @@ int zmk_mouse_ps2_init_power_on_reset() {
     }
 
     LOG_DBG("Finished Power-On-Reset successfully...");
+
+    // CRITICAL: Clear any accumulated data in the buffer from movement during sleep/wake
+    // This prevents protocol desynchronization.
+    data->packet_idx = 0;
+    memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
+    
+    // Set discard counter to filter out initial drift/desync packets
+    data->wake_up_packets_to_discard = 10; // Increase to 10 for safety
 
     return 0;
 }

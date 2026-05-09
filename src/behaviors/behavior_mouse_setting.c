@@ -14,6 +14,37 @@
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_METADATA)
+
+// 鼠标设置行为的参数元数据（整合所有可选参数）
+static const struct behavior_parameter_value_metadata mms_param_values[] = {
+    // 灵敏度调节
+    {.display_name = "Sens+", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE, .value = MS_TP_SENSITIVITY_INCR},
+    {.display_name = "Sens-", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE, .value = MS_TP_SENSITIVITY_DECR},
+    // 负惯性调节
+    {.display_name = "NegInertia+", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE, .value = MS_TP_NEG_INERTIA_INCR},
+    {.display_name = "NegInertia-", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE, .value = MS_TP_NEG_INERTIA_DECR},
+    // VALUE6 调节（可根据实际含义修改display_name）
+    {.display_name = "MaxSpeed+", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE, .value = MS_TP_VALUE6_INCR},
+    {.display_name = "MaxSpeed-", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE, .value = MS_TP_VALUE6_DECR},
+};
+
+// 参数元数据集（ZMK 标准单集合写法）
+static const struct behavior_parameter_metadata_set mms_param_set[] = {
+    {
+        .param1_values = mms_param_values,
+        .param1_values_len = ARRAY_SIZE(mms_param_values),
+    }
+};
+
+// 顶层元数据结构体（关联到鼠标设置行为）
+static const struct behavior_parameter_metadata mms_metadata = {
+    .sets = mms_param_set,
+    .sets_len = ARRAY_SIZE(mms_param_set),
+};
+
+#endif
+
 static int on_keymap_binding_pressed(struct zmk_behavior_binding *binding,
                                      struct zmk_behavior_binding_event event) {
     switch (binding->param1) {
@@ -55,7 +86,12 @@ static int on_keymap_binding_released(struct zmk_behavior_binding *binding,
 static int zmk_behavior_mouse_setting_init(const struct device *dev) { return 0; };
 
 static const struct behavior_driver_api zmk_behavior_mouse_setting_driver_api = {
-    .binding_pressed = on_keymap_binding_pressed, .binding_released = on_keymap_binding_released};
+    .binding_pressed = on_keymap_binding_pressed,
+    .binding_released = on_keymap_binding_released,
+#if IS_ENABLED(CONFIG_ZMK_BEHAVIOR_METADATA)
+    .parameter_metadata = &mms_metadata,
+#endif // IS_ENABLED(CONFIG_ZMK_BEHAVIOR_METADATA)
+};
 
 BEHAVIOR_DT_INST_DEFINE(0, zmk_behavior_mouse_setting_init, NULL, NULL, NULL, POST_KERNEL,
                         CONFIG_KERNEL_INIT_PRIORITY_DEFAULT,

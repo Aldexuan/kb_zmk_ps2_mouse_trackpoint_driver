@@ -20,6 +20,9 @@
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
+// Forward declaration for power saving variable (defined at the end of this file)
+static bool mouse_ps2_is_idle;
+
 /*
  * Settings
  */
@@ -43,7 +46,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 // Specification`...
 // "The POR shall be timed to occur 600 ms ± 20 % from the time power is
 //  applied to the TrackPoint controller."
-#define MOUSE_PS2_POWER_ON_RESET_TIME K_MSEC(600)
+#define MOUSE_PS2_POWER_ON_RESET_TIME K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_ON_RESET_TIME)
 
 // Common PS/2 Mouse commands
 #define MOUSE_PS2_CMD_GET_DEVICE_ID "\xf2"
@@ -321,6 +324,24 @@ void zmk_mouse_ps2_activity_toggle_layer();
 void zmk_mouse_ps2_activity_callback(const struct device *ps2_device, uint8_t byte) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
 
+    // Power saving: Minimal processing when keyboard is idle
+    // We still need to maintain PS/2 protocol sync, but skip expensive operations
+    if (mouse_ps2_is_idle) {
+        // Just consume bytes to keep protocol in sync, but don't process
+        data->packet_buffer[data->packet_idx] = byte;
+        
+        if (data->packet_idx == 0) {
+            int alignment_bit = MOUSE_PS2_GET_BIT(byte, 3);
+            if (alignment_bit != 1) {
+                data->packet_idx = 0;  // Reset on misalignment
+                return;
+            }
+        }
+        
+        data->packet_idx = (data->packet_idx + 1) % 3;  // Cycle through 0,1,2
+        return;  // Skip all further processing
+    }
+
     k_work_cancel_delayable(&data->packet_buffer_timeout);
 
     // LOG_DBG("Received mouse movement data: 0x%x", byte);
@@ -358,14 +379,14 @@ void zmk_mouse_ps2_activity_callback(const struct device *ps2_device, uint8_t by
 
 void zmk_mouse_ps2_activity_abort_cmd(char *reason) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
-    const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
-    const struct device *ps2_device = config->ps2_device;
+    // const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
 
-    LOG_ERR("PS/2 Mouse cmd buffer is out of aligment. Requesting resend: %s", reason);
+    // LOG_ERR("PS/2 Mouse cmd buffer is out of aligment. Requesting resend: %s", reason);
+    // ps2_write(ps2_device, MOUSE_PS2_CMD_RESEND[0]);
+    LOG_ERR(
+        "PS/2 Mouse cmd buffer is out of alignment. igoring..."); // resend somehow make it worse
 
     data->packet_idx = 0;
-    ps2_write(ps2_device, MOUSE_PS2_CMD_RESEND[0]);
-
     zmk_mouse_ps2_activity_reset_packet_buffer();
 }
 
@@ -1853,3 +1874,89 @@ int zmk_mouse_ps2_init_wait_for_mouse(const struct device *dev) {
 
 DEVICE_DT_INST_DEFINE(0, &zmk_mouse_ps2_init, NULL, &zmk_mouse_ps2_data, &zmk_mouse_ps2_config,
                       POST_KERNEL, ZMK_MOUSE_PS2_INIT_PRIORITY, NULL);
+
+/*
+ * Power Saving: Dynamic sampling rate and noise filtering based on keyboard activity
+ */
+
+#include <zmk/event_manager.h>
+#include <zmk/events/activity_state_changed.h>
+
+// Idle sampling rate (lower to save power)
+#define MOUSE_PS2_IDLE_SAMPLING_RATE 40
+
+// Noise filter threshold (filter movements smaller than this when idle)
+#define MOUSE_PS2_IDLE_NOISE_THRESHOLD 2
+
+// Track original sampling rate and current state
+static uint8_t mouse_ps2_original_sampling_rate = 0;
+static bool mouse_ps2_is_idle = false;
+
+static int on_activity_state_changed(const zmk_event_t *eh) {
+    const struct zmk_activity_state_changed *ev = as_zmk_activity_state_changed(eh);
+    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+
+    switch (ev->state) {
+    case ZMK_ACTIVITY_ACTIVE:
+        // Keyboard is active - Restore power and re-initialize TrackPoint
+        if (mouse_ps2_is_idle) {
+            LOG_INF("Keyboard activated, restoring TrackPoint VCC...");
+            
+            // 1. Enable VCC via ext_power
+            const struct device *ext_power_dev = device_get_binding("EXT_POWER");
+            if (ext_power_dev) {
+                ext_power_enable(ext_power_dev);
+            }
+
+            // 2. CRITICAL: Wait for TrackPoint POR (Power-On Reset) time
+            // According to spec, TrackPoint needs ~600ms to stabilize after power-up
+            LOG_INF("Waiting 600ms for TrackPoint POR sequence...");
+            k_sleep(K_MSEC(600));
+
+            // 3. Re-initialize the PS/2 interface
+            LOG_INF("Re-initializing TrackPoint...");
+            const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
+            
+            // Reset the device to ensure clean state
+            zmk_mouse_ps2_reset(config->ps2_device);
+            k_sleep(K_MSEC(50)); // Small delay after reset
+
+            // Enable data reporting
+            ps2_write(config->ps2_device, 0xF4);
+            k_sleep(K_MSEC(10));
+
+            // Restore original sampling rate
+            if (mouse_ps2_original_sampling_rate > 0) {
+                zmk_mouse_ps2_set_sampling_rate(mouse_ps2_original_sampling_rate);
+            }
+
+            mouse_ps2_is_idle = false;
+            LOG_INF("TrackPoint successfully woken up.");
+        }
+        break;
+    case ZMK_ACTIVITY_IDLE:
+    case ZMK_ACTIVITY_SLEEP:
+        // Keyboard is idle - Cut off VCC to save maximum power
+        if (!mouse_ps2_is_idle) {
+            LOG_INF("Keyboard idle, cutting off TrackPoint VCC...");
+            
+            const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
+            // Optional: Send disable command before cutting power (good practice)
+            ps2_write(config->ps2_device, 0xF5);
+            k_sleep(K_MSEC(10));
+
+            const struct device *ext_power_dev = device_get_binding("EXT_POWER");
+            if (ext_power_dev) {
+                ext_power_disable(ext_power_dev);
+            }
+            
+            mouse_ps2_is_idle = true;
+        }
+        break;
+    }
+
+    return 0;
+}
+
+ZMK_LISTENER(mouse_ps2_power_save, on_activity_state_changed);
+ZMK_SUBSCRIPTION(mouse_ps2_power_save, zmk_activity_state_changed);

@@ -23,6 +23,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 // Forward declaration for power saving variable (defined at the end of this file)
 static bool mouse_ps2_is_idle;
+static uint8_t mouse_ps2_original_sampling_rate;
 
 // Define the GPIO used for TrackPoint VCC control
 // Hardware: P0.13, Active Low (Low = Power Off)
@@ -455,7 +456,7 @@ void zmk_mouse_ps2_activity_process_cmd(zmk_mouse_ps2_packet_mode packet_mode, u
         // 3. Hard Reset Sequence
         const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
         LOG_INF("Sending Reset command (0xFF)...");
-        zmk_mouse_ps2_reset(config->ps2_device);
+        ps2_write(config->ps2_device, 0xFF); // Send Reset command directly
         
         // Wait for the device to respond with AA (Self-test passed)
         // In a real driver, we'd read the response, but for now we wait for stability

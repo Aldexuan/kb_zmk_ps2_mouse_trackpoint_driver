@@ -12,9 +12,12 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/ps2.h>
+#include <zephyr/drivers/pinctrl.h>
+#include <zephyr/drivers/uart.h>
 #include <zephyr/dt-bindings/input/input-event-codes.h>
 #include <zephyr/input/input.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/pm/device.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/util.h>
 
@@ -162,6 +165,9 @@ struct zmk_mouse_ps2_config {
     struct gpio_dt_spec rst_gpio;
     int rst_gpio_port_num;
 
+    struct gpio_dt_spec vcc_gpio;
+    int vcc_gpio_port_num;
+
     bool scroll_mode;
     bool disable_clicking;
     int sampling_rate;
@@ -236,6 +242,19 @@ static const struct zmk_mouse_ps2_config zmk_mouse_ps2_config = {
     .rst_gpio_port_num = 0,
 #endif
 
+#if DT_INST_NODE_HAS_PROP(0, vcc_gpios)
+    .vcc_gpio = GPIO_DT_SPEC_INST_GET(0, vcc_gpios),
+    .vcc_gpio_port_num = DT_PROP(DT_INST_PHANDLE(0, vcc_gpios), port),
+#else
+    .vcc_gpio =
+        {
+            .port = NULL,
+            .pin = 0,
+            .dt_flags = 0,
+        },
+    .vcc_gpio_port_num = 0,
+#endif
+
     .scroll_mode = DT_INST_PROP_OR(0, scroll_mode, false),
     .disable_clicking = DT_INST_PROP_OR(0, disable_clicking, false),
     .sampling_rate = DT_INST_PROP_OR(0, sampling_rate, MOUSE_PS2_CMD_SET_SAMPLING_RATE_DEFAULT),
@@ -294,6 +313,9 @@ static int allowed_sampling_rates[] = {
  */
 
 int zmk_mouse_ps2_settings_save();
+void zmk_mouse_ps2_apply_tp_settings(void);
+int zmk_mouse_ps2_init_power_on_reset(void);
+int zmk_mouse_ps2_init_wait_for_mouse(const struct device *dev);
 
 /*
  * Helpers
@@ -1637,8 +1659,6 @@ int zmk_mouse_ps2_settings_init() {
  */
 
 static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused);
-int zmk_mouse_ps2_init_power_on_reset();
-int zmk_mouse_ps2_init_wait_for_mouse(const struct device *dev);
 
 static int zmk_mouse_ps2_init(const struct device *dev) {
     LOG_DBG("Inside zmk_mouse_ps2_init");
@@ -1688,48 +1708,7 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
 
     LOG_INF("Connected device is a %s", device_descr);
 
-    if (data->is_trackpoint == true) {
-
-        if (config->tp_press_to_select) {
-            LOG_INF("Enabling TP press to select...");
-            zmk_mouse_ps2_tp_press_to_select_set(true);
-        }
-
-        if (config->tp_press_to_select_threshold != -1) {
-            LOG_INF("Setting TP press to select thereshold to %d...",
-                    config->tp_press_to_select_threshold);
-            zmk_mouse_ps2_tp_pts_threshold_set(config->tp_press_to_select_threshold);
-        }
-
-        if (config->tp_sensitivity != -1) {
-            LOG_INF("Setting TP sensitivity to %d...", config->tp_sensitivity);
-            zmk_mouse_ps2_tp_sensitivity_set(config->tp_sensitivity);
-        }
-
-        if (config->tp_neg_inertia != -1) {
-            LOG_INF("Setting TP inertia to %d...", config->tp_neg_inertia);
-            zmk_mouse_ps2_tp_neg_inertia_set(config->tp_neg_inertia);
-        }
-
-        if (config->tp_val6_upper_speed != -1) {
-            LOG_INF("Setting TP value 6 upper speed plateau to %d...", config->tp_val6_upper_speed);
-            zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(config->tp_val6_upper_speed);
-        }
-        if (config->tp_x_invert) {
-            LOG_INF("Inverting trackpoint x axis.");
-            zmk_mouse_ps2_tp_invert_x_set(true);
-        }
-
-        if (config->tp_y_invert) {
-            LOG_INF("Inverting trackpoint y axis.");
-            zmk_mouse_ps2_tp_invert_y_set(true);
-        }
-
-        if (config->tp_xy_swap) {
-            LOG_INF("Swapping trackpoint x and y axis.");
-            zmk_mouse_ps2_tp_swap_xy_set(true);
-        }
-    }
+    zmk_mouse_ps2_apply_tp_settings();
 
     if (config->scroll_mode) {
         LOG_INF("Enabling scroll mode.");
@@ -1891,6 +1870,296 @@ int zmk_mouse_ps2_init_wait_for_mouse(const struct device *dev) {
 
 // Depends on the UART and PS2 init priorities, which are 55 and 45 by default
 #define ZMK_MOUSE_PS2_INIT_PRIORITY 90
+
+/*
+ * ------------------------------------------------------------------
+ * Idle / Active Power Control
+ * ------------------------------------------------------------------
+ *
+ * When CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING is enabled, a small
+ * "idle-pm" glue module subscribes to ZMK activity state changes and
+ * calls zmk_mouse_ps2_power_down() / zmk_mouse_ps2_power_up() from a
+ * work queue. Both functions are no-ops if the feature is disabled.
+ *
+ * The sequence was designed to survive the following failure modes
+ * observed on nice!nano v2 + TrackPoint:
+ *
+ *   1. Cutting VCC alone re-starts TP internal state (reporting=off,
+ *      config lost). The host must re-run POR, re-enable reporting,
+ *      and re-apply all TP tunables (sensitivity, inertia, ...).
+ *   2. The PS/2 self-test bytes (0xAA 0x00) emitted after VCC is
+ *      restored will otherwise poison the mouse packet parser.
+ *   3. While VCC is cut, the MCU's SCL/SDA GPIOs would back-power the
+ *      TP through its ESD diodes (parasitic 1.5-2V), preventing a
+ *      real power-off. So before cutting VCC we switch the UART
+ *      pinctrl to a low-power state and drive SCL as a low output.
+ */
+
+/*
+ * Re-applies every TrackPoint tunable that lives in volatile RAM on
+ * the TP side. Called from the init thread AND from power_up(), so
+ * that cutting VCC does not revert the user's sensitivity etc.
+ */
+void zmk_mouse_ps2_apply_tp_settings(void) {
+    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+    const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
+
+    if (!data->is_trackpoint) {
+        return;
+    }
+
+    if (config->tp_press_to_select) {
+        LOG_INF("Enabling TP press to select...");
+        zmk_mouse_ps2_tp_press_to_select_set(true);
+    }
+    if (config->tp_press_to_select_threshold != -1) {
+        LOG_INF("Setting TP press to select threshold to %d...",
+                config->tp_press_to_select_threshold);
+        zmk_mouse_ps2_tp_pts_threshold_set(config->tp_press_to_select_threshold);
+    }
+    if (config->tp_sensitivity != -1) {
+        LOG_INF("Setting TP sensitivity to %d...", config->tp_sensitivity);
+        zmk_mouse_ps2_tp_sensitivity_set(config->tp_sensitivity);
+    }
+    if (config->tp_neg_inertia != -1) {
+        LOG_INF("Setting TP inertia to %d...", config->tp_neg_inertia);
+        zmk_mouse_ps2_tp_neg_inertia_set(config->tp_neg_inertia);
+    }
+    if (config->tp_val6_upper_speed != -1) {
+        LOG_INF("Setting TP value 6 upper speed plateau to %d...", config->tp_val6_upper_speed);
+        zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(config->tp_val6_upper_speed);
+    }
+    if (config->tp_x_invert) {
+        LOG_INF("Inverting trackpoint x axis.");
+        zmk_mouse_ps2_tp_invert_x_set(true);
+    }
+    if (config->tp_y_invert) {
+        LOG_INF("Inverting trackpoint y axis.");
+        zmk_mouse_ps2_tp_invert_y_set(true);
+    }
+    if (config->tp_xy_swap) {
+        LOG_INF("Swapping trackpoint x and y axis.");
+        zmk_mouse_ps2_tp_swap_xy_set(true);
+    }
+}
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING)
+
+/*
+ * Drives a GPIO-connected power switch to the "off" state. Uses the
+ * devicetree flags (e.g. GPIO_ACTIVE_HIGH on nice!nano v2's P0.13)
+ * so a raw value of 0 here translates to "inactive" on the pin.
+ */
+static void zmk_mouse_ps2_vcc_set(bool powered) {
+    const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
+
+    if (config->vcc_gpio.port == NULL) {
+        return;
+    }
+
+    /* Re-configure as output every time: on cold boot the pin is hi-Z.
+     * gpio_pin_set_dt respects the ACTIVE_HIGH/ACTIVE_LOW flag.
+     */
+    int err = gpio_pin_configure_dt(&config->vcc_gpio,
+                                    powered ? GPIO_OUTPUT_ACTIVE : GPIO_OUTPUT_INACTIVE);
+    if (err) {
+        LOG_ERR("Failed to configure VCC GPIO (%d)", err);
+        return;
+    }
+    LOG_INF("TrackPoint VCC -> %s (P%d.%02d)", powered ? "ON" : "OFF",
+            config->vcc_gpio_port_num, config->vcc_gpio.pin);
+}
+
+/*
+ * Parks the SCL / SDA pins in a configuration that does not back-power
+ * the (now-unpowered) TrackPoint via its ESD clamp diodes.
+ *
+ * - SDA belongs to the UART peripheral, so we switch the UART pinctrl
+ *   to its "sleep" state. The user's DTS must define uart0_ps2_sleep
+ *   with low-power-enable (the example config already does).
+ * - SCL is an ordinary GPIO owned by the PS/2 driver. Driving it as
+ *   an output-low is the safest: the line is clamped to GND, which
+ *   is below TP's VCC-when-off (0 V) and no current flows through
+ *   the diode either direction.
+ * - We also suspend the UART device so the peripheral HFCLK request
+ *   is released.
+ */
+static void zmk_mouse_ps2_transport_suspend(void) {
+    const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
+    const struct device *ps2_dev = config->ps2_device;
+    int err;
+
+    /* 1. Stop the TP from reporting (no-op if already disabled, but also
+     *    calls ps2_disable_callback which clears the queue). */
+    zmk_mouse_ps2_activity_reporting_disable();
+
+    /* 2. Reach into the PS/2 UART driver's config to get the underlying
+     *    UART device + pinctrl + SCL GPIO. We resolve these via the
+     *    phandle chain from our own DT node:
+     *        mouse_ps2 --ps2-device--> uart_ps2 --parent(bus)--> uart0
+     */
+#define MOUSE_PS2_NODE       DT_DRV_INST(0)
+#define MOUSE_PS2_PS2_NODE   DT_PHANDLE(MOUSE_PS2_NODE, ps2_device)
+#define MOUSE_PS2_UART_NODE  DT_PARENT(MOUSE_PS2_PS2_NODE)
+
+#if DT_NODE_EXISTS(MOUSE_PS2_UART_NODE) && DT_NODE_HAS_STATUS(MOUSE_PS2_UART_NODE, okay)
+    const struct device *uart_dev = DEVICE_DT_GET(MOUSE_PS2_UART_NODE);
+    const struct pinctrl_dev_config *uart_pcfg =
+        PINCTRL_DT_DEV_CONFIG_GET(MOUSE_PS2_UART_NODE);
+    const struct gpio_dt_spec scl_gpio =
+        GPIO_DT_SPEC_GET(MOUSE_PS2_PS2_NODE, scl_gpios);
+#else
+    const struct device *uart_dev = NULL;
+    const struct pinctrl_dev_config *uart_pcfg = NULL;
+    const struct gpio_dt_spec scl_gpio = { .port = NULL, .pin = 0, .dt_flags = 0 };
+#endif
+
+    (void)ps2_dev;
+
+    /* 3. Disable UART RX IRQ and suspend the UART peripheral. */
+    if (uart_dev != NULL) {
+        uart_irq_rx_disable(uart_dev);
+#if IS_ENABLED(CONFIG_PM_DEVICE)
+        err = pm_device_action_run(uart_dev, PM_DEVICE_ACTION_SUSPEND);
+        if (err && err != -EALREADY) {
+            LOG_WRN("UART suspend returned %d", err);
+        }
+#endif
+    }
+
+    /* 4. Switch UART pinctrl (SDA) to its sleep / low-power state. */
+    if (uart_pcfg != NULL) {
+        err = pinctrl_apply_state(uart_pcfg, PINCTRL_STATE_SLEEP);
+        if (err < 0 && err != -ENOENT) {
+            LOG_WRN("UART pinctrl sleep returned %d", err);
+        }
+    }
+
+    /* 5. Drive SCL low so it cannot back-feed the TP. */
+    if (scl_gpio.port != NULL) {
+        err = gpio_pin_configure_dt(&scl_gpio, GPIO_OUTPUT_INACTIVE);
+        if (err) {
+            LOG_WRN("SCL low returned %d", err);
+        }
+    }
+}
+
+/*
+ * Reverses transport_suspend(): re-applies default pinctrl, resumes the
+ * UART peripheral, re-enables RX IRQ. After this the PS/2 driver is
+ * ready to talk, but we still need to re-run POR + re-init TP.
+ */
+static void zmk_mouse_ps2_transport_resume(void) {
+    int err;
+
+#if DT_NODE_EXISTS(MOUSE_PS2_UART_NODE) && DT_NODE_HAS_STATUS(MOUSE_PS2_UART_NODE, okay)
+    const struct device *uart_dev = DEVICE_DT_GET(MOUSE_PS2_UART_NODE);
+    const struct pinctrl_dev_config *uart_pcfg =
+        PINCTRL_DT_DEV_CONFIG_GET(MOUSE_PS2_UART_NODE);
+    const struct gpio_dt_spec scl_gpio =
+        GPIO_DT_SPEC_GET(MOUSE_PS2_PS2_NODE, scl_gpios);
+#else
+    const struct device *uart_dev = NULL;
+    const struct pinctrl_dev_config *uart_pcfg = NULL;
+    const struct gpio_dt_spec scl_gpio = { .port = NULL, .pin = 0, .dt_flags = 0 };
+#endif
+
+    /* SCL as input so the UART pinctrl / PS/2 driver can take it over. */
+    if (scl_gpio.port != NULL) {
+        err = gpio_pin_configure_dt(&scl_gpio, GPIO_INPUT);
+        if (err) {
+            LOG_WRN("SCL input returned %d", err);
+        }
+    }
+
+    /* Re-apply UART default pinctrl (SDA becomes UART_RX again). */
+    if (uart_pcfg != NULL) {
+        err = pinctrl_apply_state(uart_pcfg, PINCTRL_STATE_DEFAULT);
+        if (err < 0) {
+            LOG_WRN("UART pinctrl default returned %d", err);
+        }
+    }
+
+#if IS_ENABLED(CONFIG_PM_DEVICE)
+    if (uart_dev != NULL) {
+        err = pm_device_action_run(uart_dev, PM_DEVICE_ACTION_RESUME);
+        if (err && err != -EALREADY) {
+            LOG_WRN("UART resume returned %d", err);
+        }
+    }
+#endif
+
+    if (uart_dev != NULL) {
+        uart_irq_rx_enable(uart_dev);
+    }
+}
+
+int zmk_mouse_ps2_power_down(void) {
+    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+
+    LOG_INF("TrackPoint power-down: entering idle");
+
+    zmk_mouse_ps2_transport_suspend();
+
+    /* Reset parser state so any leftover bytes from before suspend
+     * (or the self-test bytes we'll get on resume) do not poison
+     * the next packet stream. */
+    data->packet_idx = 0;
+    memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
+    data->activity_reporting_on = false;
+
+    /* Finally cut VCC. Do this AFTER the pins are parked low, to
+     * avoid the back-powering scenario described above. */
+    zmk_mouse_ps2_vcc_set(false);
+
+    return 0;
+}
+
+int zmk_mouse_ps2_power_up(void) {
+    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+
+    LOG_INF("TrackPoint power-up: leaving idle");
+
+    /* 1. Restore power before touching the transport, so the TP is
+     *    actually running once we start clocking data in. */
+    zmk_mouse_ps2_vcc_set(true);
+    k_sleep(K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING_WAKE_DELAY_MS));
+
+    /* 2. Bring the PS/2 transport back online. */
+    zmk_mouse_ps2_transport_resume();
+
+    /* 3. Run the 600ms POR sequence again (no-op if rst-gpios unset).
+     *    This also clears packet_buffer and pre-loads wake_up_packets_to_discard. */
+    zmk_mouse_ps2_init_power_on_reset();
+
+    /* 4. Re-detect the device (consumes the 0xAA / 0x00 self-test bytes).
+     *    If detection fails the TP is not responsive; we log and bail out,
+     *    leaving reporting disabled. The next activity change can try again. */
+    int err = zmk_mouse_ps2_init_wait_for_mouse(data->dev);
+    if (err) {
+        LOG_ERR("TrackPoint did not respond after wake; giving up this cycle");
+        return -EIO;
+    }
+
+    /* 5. Reapply user configuration that lives in TP RAM. */
+    zmk_mouse_ps2_apply_tp_settings();
+
+    /* 6. Turn reporting back on. */
+    err = zmk_mouse_ps2_activity_reporting_enable();
+    if (err) {
+        LOG_ERR("Could not re-enable reporting after wake: %d", err);
+        return err;
+    }
+
+    return 0;
+}
+
+#else  /* !CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING */
+
+int zmk_mouse_ps2_power_down(void) { return 0; }
+int zmk_mouse_ps2_power_up(void) { return 0; }
+
+#endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING */
 
 DEVICE_DT_INST_DEFINE(0, &zmk_mouse_ps2_init, NULL, &zmk_mouse_ps2_data, &zmk_mouse_ps2_config,
                       POST_KERNEL, ZMK_MOUSE_PS2_INIT_PRIORITY, NULL);

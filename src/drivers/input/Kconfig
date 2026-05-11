@@ -30,4 +30,25 @@ config ZMK_INPUT_MOUSE_PS2_ENABLE_ERROR_MITIGATION
     bool "Tries to mitigate transmission errors. Only useful when using a PS2 driver that is prone to miscommunication like the GPIO bitbanging driver."
 	default n
 
+config ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING
+    bool "Automatically power down the PS/2 pointing device when ZMK goes idle"
+    default n
+    select PM_DEVICE
+    help
+      When enabled, the driver subscribes to ZMK activity state changes. On entering
+      ZMK_ACTIVITY_IDLE it disables reporting, suspends the underlying PS/2 transport
+      (UART pinctrl -> sleep, SCL pulled low, RX IRQ off) and, if vcc-gpios is defined,
+      cuts VCC to the device. On returning to ZMK_ACTIVITY_ACTIVE the sequence is
+      reversed, Power-On-Reset is re-run, the device is re-identified and all TP
+      settings are re-applied.
+
+config ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING_WAKE_DELAY_MS
+    int "Milliseconds to wait after VCC is restored before starting PS/2 handshake"
+    depends on ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING
+    default 50
+    help
+      Extra settle time after driving VCC high, before re-running Power-On-Reset.
+      The POR sequence itself already waits 600ms with RST asserted, so this only
+      covers LDO/cap charge time.
+
 endif # ZMK_INPUT_MOUSE_PS2

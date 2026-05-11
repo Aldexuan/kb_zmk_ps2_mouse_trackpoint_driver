@@ -14,6 +14,18 @@ properties:
     required: false
     description: GPIO to which the RST pin of the device is connected and on which the Power-On-Reset will be performed.
 
+  vcc-gpios:
+    type: phandle-array
+    required: false
+    description: |
+      GPIO that controls the VCC power rail of the pointing device (e.g. nice!nano v2's P0.13
+      which drives the on-board LDO EN pin). When driven "active" the device is powered on.
+      When the ZMK keyboard enters the idle activity state, this pin will be driven "inactive"
+      to fully cut power to the TrackPoint. On wake, the pin is driven active again and the
+      driver re-runs the Power-On-Reset sequence, re-identifies the device, and re-applies
+      all TP settings.
+      Requires CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING=y.
+
   sampling-rate:
     type: int
     description: Adjusts the sensitivity setting on trackpoint devices. The allowed values are 10, 20, 40, 60, 80, 100, 200 and the default is 100.

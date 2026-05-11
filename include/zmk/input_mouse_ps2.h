@@ -13,3 +13,17 @@ int zmk_mouse_ps2_tp_sensitivity_change(int amount);
 int zmk_mouse_ps2_tp_neg_inertia_change(int amount);
 int zmk_mouse_ps2_tp_value6_upper_plateau_speed_change(int amount);
 int zmk_mouse_ps2_tp_pts_threshold_change(int amount);
+
+/*
+ * Idle power-saving API
+ *
+ * These functions are called by the idle-PM module when ZMK activity state
+ * transitions between IDLE and ACTIVE. They are safe to call from a work
+ * queue but MUST NOT be called from an ISR (they sleep for hundreds of ms
+ * while running the TrackPoint Power-On-Reset sequence).
+ *
+ * They are no-ops (return 0) if CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING
+ * is not enabled.
+ */
+int zmk_mouse_ps2_power_down(void);
+int zmk_mouse_ps2_power_up(void);

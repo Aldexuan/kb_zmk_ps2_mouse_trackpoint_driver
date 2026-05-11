@@ -325,3 +325,4 @@ nice!nano v2 的 P0.13 驱动的是板载 3.3V LDO 的 EN：
 - 只支持 `uart-ps2` 驱动（UART 模式），不支持 `gpio-ps2`。如果你用 GPIO 驱动需要额外在 ps2_gpio.c 里实现 suspend/resume。
 - `pm_device_action_run` 需要 `CONFIG_PM_DEVICE=y`；我们在新 Kconfig 里已 `select PM_DEVICE`。
 - 唤醒延迟：TP 冷启动到可用约 600ms (POR) + 50ms (LDO) + 50ms (init_wait_for_mouse 首次尝试)。用户按键后第一次动 TP 可能会感觉到短暂延迟（常规写字场景不会感知）。
+- 空闲休眠

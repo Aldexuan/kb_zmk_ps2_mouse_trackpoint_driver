@@ -269,7 +269,7 @@ nice!nano v2 的 P0.13 驱动的是板载 3.3V LDO 的 EN：
 
 ## 九、已实施的改动汇总（patch）
 
-### 9.1 新增 / 修改的文件
+### 9.1 新增 / 修改的文件              
 
 | 文件 | 变更 |
 |---|---|
@@ -317,6 +317,8 @@ nice!nano v2 的 P0.13 驱动的是板载 3.3V LDO 的 EN：
 3. VCC 断开时 TP 那端没有 3V，SCL/SDA 没有外部上拉能量源 → 不漏电
 
 这样 TP 真的是 0 mA；nRF52 侧两个 GPIO 输出低 + 浮空也几乎不耗电（低于 1µA）。唯一会消耗的是 idle 下整机 ZMK 的常规功耗。
+
+**实现说明**：代码里 pinctrl 切 SLEEP / DEFAULT 是由 `pm_device_action_run(SUSPEND/RESUME)` 自动做的（nRF UARTE 驱动 PM 实现会帮你 apply pinctrl）。不显式调 `pinctrl_apply_state` 的原因是 Zephyr 的 `PINCTRL_DT_DEFINE()` 生成的配置变量是文件静态的，跨 TU 直接 `PINCTRL_DT_DEV_CONFIG_GET` 会链接失败（本驱动和 ps2_uart 在不同 .c 里）。SCL 是普通 GPIO，没有 pm_device 机制，所以手动 `gpio_pin_configure_dt(OUTPUT_INACTIVE)` 拉低。
 
 ### 9.5 已知限制
 

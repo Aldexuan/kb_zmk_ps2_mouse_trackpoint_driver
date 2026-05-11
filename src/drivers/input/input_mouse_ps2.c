@@ -12,7 +12,6 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/ps2.h>
-#include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/dt-bindings/input/input-event-codes.h>
 #include <zephyr/input/input.h>
@@ -1994,9 +1993,17 @@ static void zmk_mouse_ps2_transport_suspend(void) {
     zmk_mouse_ps2_activity_reporting_disable();
 
     /* 2. Reach into the PS/2 UART driver's config to get the underlying
-     *    UART device + pinctrl + SCL GPIO. We resolve these via the
-     *    phandle chain from our own DT node:
+     *    UART device + SCL GPIO. We resolve these via the phandle chain
+     *    from our own DT node:
      *        mouse_ps2 --ps2-device--> uart_ps2 --parent(bus)--> uart0
+     *
+     *    NOTE: we do NOT call pinctrl_apply_state() here. That would
+     *    require PINCTRL_DT_DEV_CONFIG_GET on uart0, but Zephyr's
+     *    PINCTRL_DT_DEFINE() makes that symbol file-static inside
+     *    ps2_uart.c, so we can't reference it from a different TU.
+     *    Instead we rely on pm_device_action_run(SUSPEND), which the
+     *    nRF UARTE driver implements to switch pinctrl to SLEEP state
+     *    (and release the HFCLK request) on its own.
      */
 #define MOUSE_PS2_NODE       DT_DRV_INST(0)
 #define MOUSE_PS2_PS2_NODE   DT_PHANDLE(MOUSE_PS2_NODE, ps2_device)
@@ -2004,19 +2011,19 @@ static void zmk_mouse_ps2_transport_suspend(void) {
 
 #if DT_NODE_EXISTS(MOUSE_PS2_UART_NODE) && DT_NODE_HAS_STATUS(MOUSE_PS2_UART_NODE, okay)
     const struct device *uart_dev = DEVICE_DT_GET(MOUSE_PS2_UART_NODE);
-    const struct pinctrl_dev_config *uart_pcfg =
-        PINCTRL_DT_DEV_CONFIG_GET(MOUSE_PS2_UART_NODE);
     const struct gpio_dt_spec scl_gpio =
         GPIO_DT_SPEC_GET(MOUSE_PS2_PS2_NODE, scl_gpios);
 #else
     const struct device *uart_dev = NULL;
-    const struct pinctrl_dev_config *uart_pcfg = NULL;
     const struct gpio_dt_spec scl_gpio = { .port = NULL, .pin = 0, .dt_flags = 0 };
 #endif
 
     (void)ps2_dev;
 
-    /* 3. Disable UART RX IRQ and suspend the UART peripheral. */
+    /* 3. Disable UART RX IRQ and suspend the UART peripheral.
+     *    pm_device SUSPEND on nRF UARTE also applies PINCTRL_STATE_SLEEP
+     *    to the SDA pin (low-power-enable), so we don't need to do it
+     *    manually. */
     if (uart_dev != NULL) {
         uart_irq_rx_disable(uart_dev);
 #if IS_ENABLED(CONFIG_PM_DEVICE)
@@ -2027,15 +2034,9 @@ static void zmk_mouse_ps2_transport_suspend(void) {
 #endif
     }
 
-    /* 4. Switch UART pinctrl (SDA) to its sleep / low-power state. */
-    if (uart_pcfg != NULL) {
-        err = pinctrl_apply_state(uart_pcfg, PINCTRL_STATE_SLEEP);
-        if (err < 0 && err != -ENOENT) {
-            LOG_WRN("UART pinctrl sleep returned %d", err);
-        }
-    }
-
-    /* 5. Drive SCL low so it cannot back-feed the TP. */
+    /* 4. Drive SCL low so it cannot back-feed the TP via ESD diodes.
+     *    SCL is an ordinary GPIO owned by the ps2_uart driver, not the
+     *    UART peripheral, so pm_device doesn't touch it. */
     if (scl_gpio.port != NULL) {
         err = gpio_pin_configure_dt(&scl_gpio, GPIO_OUTPUT_INACTIVE);
         if (err) {
@@ -2054,17 +2055,14 @@ static void zmk_mouse_ps2_transport_resume(void) {
 
 #if DT_NODE_EXISTS(MOUSE_PS2_UART_NODE) && DT_NODE_HAS_STATUS(MOUSE_PS2_UART_NODE, okay)
     const struct device *uart_dev = DEVICE_DT_GET(MOUSE_PS2_UART_NODE);
-    const struct pinctrl_dev_config *uart_pcfg =
-        PINCTRL_DT_DEV_CONFIG_GET(MOUSE_PS2_UART_NODE);
     const struct gpio_dt_spec scl_gpio =
         GPIO_DT_SPEC_GET(MOUSE_PS2_PS2_NODE, scl_gpios);
 #else
     const struct device *uart_dev = NULL;
-    const struct pinctrl_dev_config *uart_pcfg = NULL;
     const struct gpio_dt_spec scl_gpio = { .port = NULL, .pin = 0, .dt_flags = 0 };
 #endif
 
-    /* SCL as input so the UART pinctrl / PS/2 driver can take it over. */
+    /* SCL as input so the ps2_uart driver can take it over again. */
     if (scl_gpio.port != NULL) {
         err = gpio_pin_configure_dt(&scl_gpio, GPIO_INPUT);
         if (err) {
@@ -2072,14 +2070,9 @@ static void zmk_mouse_ps2_transport_resume(void) {
         }
     }
 
-    /* Re-apply UART default pinctrl (SDA becomes UART_RX again). */
-    if (uart_pcfg != NULL) {
-        err = pinctrl_apply_state(uart_pcfg, PINCTRL_STATE_DEFAULT);
-        if (err < 0) {
-            LOG_WRN("UART pinctrl default returned %d", err);
-        }
-    }
-
+    /* pm_device RESUME on nRF UARTE also re-applies PINCTRL_STATE_DEFAULT
+     * (SDA becomes UART_RX again), so again we don't need a manual
+     * pinctrl_apply_state() call here. */
 #if IS_ENABLED(CONFIG_PM_DEVICE)
     if (uart_dev != NULL) {
         err = pm_device_action_run(uart_dev, PM_DEVICE_ACTION_RESUME);

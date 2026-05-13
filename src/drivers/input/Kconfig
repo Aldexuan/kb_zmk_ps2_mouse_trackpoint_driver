@@ -45,10 +45,13 @@ config ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING
 config ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING_WAKE_DELAY_MS
     int "Milliseconds to wait after VCC is restored before starting PS/2 handshake"
     depends on ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING
-    default 50
+    default 200
     help
       Extra settle time after driving VCC high, before re-running Power-On-Reset.
       The POR sequence itself already waits 600ms with RST asserted, so this only
-      covers LDO/cap charge time.
+      covers LDO/cap charge time and — more importantly — gives the TP a fully
+      stable VCC rail before its internal Z-force zero calibration runs.
+      Shorter values (e.g. 50ms) can cause the calibration to latch a biased
+      baseline, which presents as the cursor continuously drifting after wake.
 
 endif # ZMK_INPUT_MOUSE_PS2

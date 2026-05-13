@@ -59,10 +59,6 @@ struct input_listener_ps2_data {
     struct k_work_delayable layer_toggle_activation_delay;
     struct k_work_delayable layer_toggle_deactivation_delay;
     int64_t last_scroll_report_time;
-
-    // Scroll accumulator for smooth scrolling with dynamic divisor
-    int16_t scroll_residue_x;
-    int16_t scroll_residue_y;
 };
 
 struct input_listener_ps2_config {
@@ -77,11 +73,6 @@ struct input_listener_ps2_config {
     int scroll_layer;
     int scroll_speed_num;
     int scroll_speed_den;
-    int scroll_deadzone;
-    int scroll_divisor_slow;
-    int scroll_divisor_fast;
-    int scroll_input_max;
-    bool scroll_dominant_axis;
 };
 
 void zmk_input_listener_ps2_layer_toggle_input_rel_received(
@@ -198,38 +189,28 @@ static void filter_with_input_config(const struct input_listener_ps2_config *cfg
 
     if (cfg->scroll_layer >=0 && zmk_keymap_highest_layer_active() == cfg->scroll_layer) {
         int16_t original_val = evt->value;
+        int16_t scaled_val = original_val;
 
-        /* Convert mouse axis to scroll axis */
-        uint16_t scroll_code;
-        int8_t dir_mult = 1;
+        if (abs(original_val) >= 128) scaled_val = original_val /24;
+        else if (abs(original_val)>=64) scaled_val = original_val /16;
+        else if (abs(original_val)>=32) scaled_val = original_val /12;
+        else if (abs(original_val)>=21) scaled_val = original_val /8;
+        else if (abs(original_val)>=3) scaled_val = original_val>0?1:-1;
+        else scaled_val = 0;
+
         switch(evt->code) {
             case INPUT_REL_X:
-                scroll_code = INPUT_REL_HWHEEL;
-                dir_mult = cfg->xy_swap ? -1 : 1;
+                evt->code = INPUT_REL_HWHEEL;
+                if (cfg->xy_swap) scaled_val = -scaled_val;
                 break;
             case INPUT_REL_Y:
-                scroll_code = INPUT_REL_WHEEL;
-                dir_mult = cfg->xy_swap ? 1 : -1;
+                evt->code = INPUT_REL_WHEEL;
+                scaled_val = cfg->xy_swap ? scaled_val : -scaled_val;
                 break;
-            default:
-                evt->value = 0;
-                return;
         }
 
-        evt->code = scroll_code;
-
-        /* Dominant axis locking: zero out the weaker axis to prevent
-         * diagonal scrolling. Uses a 3:2 ratio threshold. */
-        if (cfg->scroll_dominant_axis) {
-            /* We can't see both axes here (events come one at a time),
-             * so dominant axis locking is handled at the report stage.
-             * For now, just pass through. The actual locking is done
-             * in the sync block below via the accumulator approach. */
-        }
-
-        /* Apply direction multiplier but don't scale yet —
-         * the accumulator + dynamic divisor handles speed. */
-        evt->value = original_val * dir_mult;
+        // 步骤4：最终赋值（分级后的值）
+        evt->value = scaled_val;
     }
 
 }
@@ -263,83 +244,13 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
 
     if (evt->sync) {
         if (config->scroll_layer >= 0 && zmk_keymap_highest_layer_active() == config->scroll_layer) {
-            int16_t sx = data->mouse.wheel_data.x;
-            int16_t sy = data->mouse.wheel_data.y;
-
-            /* Dominant axis locking */
-            if (config->scroll_dominant_axis) {
-                int abs_sx = abs(sx);
-                int abs_sy = abs(sy);
-                /* 3:2 ratio: one axis must be 1.5x the other to "win" */
-                if (abs_sy * 2 > abs_sx * 3) {
-                    sx = 0; /* pure vertical */
-                } else if (abs_sx * 2 > abs_sy * 3) {
-                    sy = 0; /* pure horizontal */
-                } else {
-                    sx = 0; sy = 0; /* diagonal deadzone */
-                }
+            int64_t now = k_uptime_get();
+            if (now - data->last_scroll_report_time < 40) {
+                clear_xy_data(&data->mouse.wheel_data);
+                data->mouse.button_set = data->mouse.button_clear = 0;
+                return;
             }
-
-            /* Process each scroll axis with deadzone + dynamic divisor + accumulator */
-            int16_t scroll_out_x = 0;
-            int16_t scroll_out_y = 0;
-
-            /* --- X axis (horizontal scroll) --- */
-            {
-                int abs_val = abs(sx);
-                if (abs_val <= config->scroll_deadzone) {
-                    data->scroll_residue_x = 0;
-                } else {
-                    if (abs_val > config->scroll_input_max) {
-                        abs_val = config->scroll_input_max;
-                    }
-                    int divisor = config->scroll_divisor_slow -
-                        ((config->scroll_divisor_slow - config->scroll_divisor_fast) * abs_val)
-                        / config->scroll_input_max;
-                    if (divisor < 1) divisor = 1;
-
-                    data->scroll_residue_x += sx;
-                    scroll_out_x = data->scroll_residue_x / divisor;
-                    if (scroll_out_x != 0) {
-                        data->scroll_residue_x %= divisor;
-                    }
-                }
-            }
-
-            /* --- Y axis (vertical scroll) --- */
-            {
-                int abs_val = abs(sy);
-                if (abs_val <= config->scroll_deadzone) {
-                    data->scroll_residue_y = 0;
-                } else {
-                    if (abs_val > config->scroll_input_max) {
-                        abs_val = config->scroll_input_max;
-                    }
-                    int divisor = config->scroll_divisor_slow -
-                        ((config->scroll_divisor_slow - config->scroll_divisor_fast) * abs_val)
-                        / config->scroll_input_max;
-                    if (divisor < 1) divisor = 1;
-
-                    data->scroll_residue_y += sy;
-                    scroll_out_y = data->scroll_residue_y / divisor;
-                    if (scroll_out_y != 0) {
-                        data->scroll_residue_y %= divisor;
-                    }
-                }
-            }
-
-            if (scroll_out_x != 0 || scroll_out_y != 0) {
-                zmk_hid_mouse_scroll_set(scroll_out_x, scroll_out_y);
-                zmk_endpoints_send_mouse_report();
-                zmk_hid_mouse_scroll_set(0, 0);
-            }
-
-            /* Clear all mouse data for this sync cycle */
-            zmk_hid_mouse_movement_set(0, 0);
-            clear_xy_data(&data->mouse.data);
-            clear_xy_data(&data->mouse.wheel_data);
-            data->mouse.button_set = data->mouse.button_clear = 0;
-            return;
+            data->last_scroll_report_time = now;
         }
 
         if (data->mouse.wheel_data.mode == INPUT_LISTENER_XY_DATA_MODE_REL) {
@@ -470,19 +381,12 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                             .scroll_layer = DT_INST_PROP(n, scroll_layer),                         \
                             .scroll_speed_num = DT_INST_PROP(n, scroll_speed_num),                 \
                             .scroll_speed_den = DT_INST_PROP(n, scroll_speed_den),                 \
-                            .scroll_deadzone = DT_INST_PROP(n, scroll_deadzone),                   \
-                            .scroll_divisor_slow = DT_INST_PROP(n, scroll_divisor_slow),           \
-                            .scroll_divisor_fast = DT_INST_PROP(n, scroll_divisor_fast),           \
-                            .scroll_input_max = DT_INST_PROP(n, scroll_input_max),                 \
-                            .scroll_dominant_axis = DT_INST_PROP(n, scroll_dominant_axis),          \
                         };                                                                         \
                     static struct input_listener_ps2_data data_##n =                               \
                         {                                                                          \
                             .dev = DEVICE_DT_INST_GET(n),                                          \
                             .layer_toggle_layer_enabled = false,                                   \
                             .layer_toggle_last_mouse_package_time = 0,                             \
-                            .scroll_residue_x = 0,                                                 \
-                            .scroll_residue_y = 0,                                                 \
                         };                                                                         \
                     void input_handler_ps2_##n(struct input_event *evt) {                          \
                         input_handler_ps2(&config_##n, &data_##n, evt);                            \

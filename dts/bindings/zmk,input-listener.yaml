@@ -49,39 +49,3 @@ properties:
     default: 2
     required: false
     description: Denominator for scroll speed scaling factor (e.g., 10 for 1/10 speed, 20 for 1/20 speed)
-  scroll-deadzone:
-    type: int
-    default: 2
-    required: false
-    description: |
-      Minimum absolute motion value (per axis) required to register as scroll input.
-      Values at or below this threshold are treated as noise and discarded.
-      Also resets the scroll accumulator to prevent noise from slowly building up.
-  scroll-divisor-slow:
-    type: int
-    default: 60
-    required: false
-    description: |
-      Divisor used for slow scroll movements. Higher = more input needed per scroll tick.
-      The effective divisor interpolates between slow and fast based on input magnitude.
-  scroll-divisor-fast:
-    type: int
-    default: 20
-    required: false
-    description: |
-      Divisor used for fast scroll movements. Lower = less input needed per scroll tick.
-      The effective divisor interpolates between slow and fast based on input magnitude.
-  scroll-input-max:
-    type: int
-    default: 128
-    required: false
-    description: |
-      The input magnitude at which the divisor reaches its minimum (scroll-divisor-fast).
-      Values above this are clamped.
-  scroll-dominant-axis:
-    type: boolean
-    required: false
-    description: |
-      When enabled, scroll mode locks to the dominant axis (the axis with larger movement).
-      This prevents diagonal scrolling and makes vertical/horizontal scrolling more precise.
-      If neither axis dominates (within a 3:2 ratio), both axes are zeroed (diagonal deadzone).

@@ -561,15 +561,6 @@ void zmk_mouse_ps2_activity_move_mouse(int16_t mov_x, int16_t mov_y) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
     int ret = 0;
 
-    /* Deadzone filter: TrackPoints produce occasional 1-unit noise packets
-     * even when completely untouched. If we report these to ZMK, the
-     * activity timer resets and the keyboard never enters idle/sleep.
-     * Drop packets where BOTH axes are within the deadzone. */
-    const int deadzone = 1;
-    if (abs(mov_x) <= deadzone && abs(mov_y) <= deadzone) {
-        return;
-    }
-
     bool have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
     bool have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
 
@@ -1905,15 +1896,10 @@ int zmk_mouse_ps2_init_wait_for_mouse(const struct device *dev) {
 
 /*
  * Re-applies every TrackPoint tunable that lives in volatile RAM on
- * the TP side.
- *
- * When from_wake=false (init path): uses DTS config values. The settings
- * subsystem will later override via zmk_mouse_ps2_settings_restore().
- *
- * When from_wake=true (wake path): uses data->tp_* live RAM values which
- * already reflect any runtime &mms adjustments the user made.
+ * the TP side. Called from the init thread AND from power_up(), so
+ * that cutting VCC does not revert the user's sensitivity etc.
  */
-static void zmk_mouse_ps2_apply_tp_settings_impl(bool from_wake) {
+void zmk_mouse_ps2_apply_tp_settings(void) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
     const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
 
@@ -1925,49 +1911,35 @@ static void zmk_mouse_ps2_apply_tp_settings_impl(bool from_wake) {
         LOG_INF("Enabling TP press to select...");
         zmk_mouse_ps2_tp_press_to_select_set(true);
     }
-
-    if (from_wake) {
-        /* Wake path: push the live RAM-cached values back into the TP. */
-        LOG_INF("Wake: restoring TP sensitivity=%u inertia=%u value6=%u pts=%u",
-                data->tp_sensitivity, data->tp_neg_inertia, data->tp_value6,
-                data->tp_pts_threshold);
-        zmk_mouse_ps2_tp_sensitivity_set(data->tp_sensitivity);
-        zmk_mouse_ps2_tp_neg_inertia_set(data->tp_neg_inertia);
-        zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(data->tp_value6);
-        zmk_mouse_ps2_tp_pts_threshold_set(data->tp_pts_threshold);
-    } else {
-        /* Init path: use DTS values (settings_restore will override later). */
-        if (config->tp_press_to_select_threshold != -1) {
-            zmk_mouse_ps2_tp_pts_threshold_set(config->tp_press_to_select_threshold);
-        }
-        if (config->tp_sensitivity != -1) {
-            LOG_INF("Setting TP sensitivity to %d...", config->tp_sensitivity);
-            zmk_mouse_ps2_tp_sensitivity_set(config->tp_sensitivity);
-        }
-        if (config->tp_neg_inertia != -1) {
-            LOG_INF("Setting TP inertia to %d...", config->tp_neg_inertia);
-            zmk_mouse_ps2_tp_neg_inertia_set(config->tp_neg_inertia);
-        }
-        if (config->tp_val6_upper_speed != -1) {
-            LOG_INF("Setting TP value 6 to %d...", config->tp_val6_upper_speed);
-            zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(config->tp_val6_upper_speed);
-        }
+    if (config->tp_press_to_select_threshold != -1) {
+        LOG_INF("Setting TP press to select threshold to %d...",
+                config->tp_press_to_select_threshold);
+        zmk_mouse_ps2_tp_pts_threshold_set(config->tp_press_to_select_threshold);
     }
-
+    if (config->tp_sensitivity != -1) {
+        LOG_INF("Setting TP sensitivity to %d...", config->tp_sensitivity);
+        zmk_mouse_ps2_tp_sensitivity_set(config->tp_sensitivity);
+    }
+    if (config->tp_neg_inertia != -1) {
+        LOG_INF("Setting TP inertia to %d...", config->tp_neg_inertia);
+        zmk_mouse_ps2_tp_neg_inertia_set(config->tp_neg_inertia);
+    }
+    if (config->tp_val6_upper_speed != -1) {
+        LOG_INF("Setting TP value 6 upper speed plateau to %d...", config->tp_val6_upper_speed);
+        zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(config->tp_val6_upper_speed);
+    }
     if (config->tp_x_invert) {
+        LOG_INF("Inverting trackpoint x axis.");
         zmk_mouse_ps2_tp_invert_x_set(true);
     }
     if (config->tp_y_invert) {
+        LOG_INF("Inverting trackpoint y axis.");
         zmk_mouse_ps2_tp_invert_y_set(true);
     }
     if (config->tp_xy_swap) {
+        LOG_INF("Swapping trackpoint x and y axis.");
         zmk_mouse_ps2_tp_swap_xy_set(true);
     }
-}
-
-/* Init path wrapper */
-void zmk_mouse_ps2_apply_tp_settings(void) {
-    zmk_mouse_ps2_apply_tp_settings_impl(false);
 }
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING)
@@ -2064,14 +2036,7 @@ static void zmk_mouse_ps2_transport_suspend(void) {
 
     /* 4. Drive SCL low so it cannot back-feed the TP via ESD diodes.
      *    SCL is an ordinary GPIO owned by the ps2_uart driver, not the
-     *    UART peripheral, so pm_device doesn't touch it.
-     *
-     *    NOTE: Use GPIO_OUTPUT_INACTIVE (push-pull drive to GND), NOT
-     *    GPIO_INPUT | GPIO_PULL_DOWN. On nRF52 the internal pull-down
-     *    is a ~13kΩ resistor; any residual voltage from TP ESD clamps
-     *    or PCB parasitics will leak current through it (~30µA measured).
-     *    Push-pull output low is a hard connection to GND with no
-     *    leakage path. */
+     *    UART peripheral, so pm_device doesn't touch it. */
     if (scl_gpio.port != NULL) {
         err = gpio_pin_configure_dt(&scl_gpio, GPIO_OUTPUT_INACTIVE);
         if (err) {
@@ -2148,42 +2113,31 @@ int zmk_mouse_ps2_power_up(void) {
 
     LOG_INF("TrackPoint power-up: leaving idle");
 
-    /* 1. Restore power. */
+    /* 1. Restore power before touching the transport, so the TP is
+     *    actually running once we start clocking data in. */
     zmk_mouse_ps2_vcc_set(true);
     k_sleep(K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING_WAKE_DELAY_MS));
 
     /* 2. Bring the PS/2 transport back online. */
     zmk_mouse_ps2_transport_resume();
 
-    /* 3. Run the 600ms POR sequence (no-op if rst-gpios unset). */
+    /* 3. Run the 600ms POR sequence again (no-op if rst-gpios unset).
+     *    This also clears packet_buffer and pre-loads wake_up_packets_to_discard. */
     zmk_mouse_ps2_init_power_on_reset();
 
-    /* 4. Re-detect the device (consumes 0xAA / 0x00 self-test bytes). */
+    /* 4. Re-detect the device (consumes the 0xAA / 0x00 self-test bytes).
+     *    If detection fails the TP is not responsive; we log and bail out,
+     *    leaving reporting disabled. The next activity change can try again. */
     int err = zmk_mouse_ps2_init_wait_for_mouse(data->dev);
     if (err) {
         LOG_ERR("TrackPoint did not respond after wake; giving up this cycle");
         return -EIO;
     }
 
-    /* 5. Let the TP settle after POR. The Z-force sensor needs a brief
-     *    period with no mechanical disturbance to establish a stable
-     *    baseline. We do NOT send 0xFF here — a second reset would
-     *    re-trigger calibration and can latch a biased baseline if
-     *    there's any residual vibration or finger contact. */
-    k_sleep(K_MSEC(100));
+    /* 5. Reapply user configuration that lives in TP RAM. */
+    zmk_mouse_ps2_apply_tp_settings();
 
-    /* 6. Hard-reset the parser state and set a generous discard window.
-     *    The first ~30 packets after POR often carry residual drift as
-     *    the TP's internal filter converges. Discarding them prevents
-     *    any visible cursor jump. */
-    data->packet_idx = 0;
-    memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
-    data->wake_up_packets_to_discard = 50;
-
-    /* 7. Reapply user configuration that lives in TP RAM. */
-    zmk_mouse_ps2_apply_tp_settings_impl(true);
-
-    /* 8. Turn reporting back on. */
+    /* 6. Turn reporting back on. */
     err = zmk_mouse_ps2_activity_reporting_enable();
     if (err) {
         LOG_ERR("Could not re-enable reporting after wake: %d", err);

@@ -561,6 +561,15 @@ void zmk_mouse_ps2_activity_move_mouse(int16_t mov_x, int16_t mov_y) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
     int ret = 0;
 
+    /* Deadzone filter: TrackPoints produce occasional 1-unit noise packets
+     * even when completely untouched. If we report these to ZMK, the
+     * activity timer resets and the keyboard never enters idle/sleep.
+     * Drop packets where BOTH axes are within the deadzone. */
+    const int deadzone = 1;
+    if (abs(mov_x) <= deadzone && abs(mov_y) <= deadzone) {
+        return;
+    }
+
     bool have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
     bool have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
 
@@ -1896,15 +1905,15 @@ int zmk_mouse_ps2_init_wait_for_mouse(const struct device *dev) {
 
 /*
  * Re-applies every TrackPoint tunable that lives in volatile RAM on
- * the TP side. Called from the init thread AND from power_up(), so
- * that cutting VCC does not revert the user's sensitivity etc.
+ * the TP side.
  *
- * Uses data->tp_* (the live RAM-cached values) which are kept up-to-date
- * by every tp_*_set() call — including those triggered by &mms behaviors
- * and by the settings restore callback at boot. So this single sweep
- * reproduces exactly whatever the user had before we cut VCC.
+ * When from_wake=false (init path): uses DTS config values. The settings
+ * subsystem will later override via zmk_mouse_ps2_settings_restore().
+ *
+ * When from_wake=true (wake path): uses data->tp_* live RAM values which
+ * already reflect any runtime &mms adjustments the user made.
  */
-void zmk_mouse_ps2_apply_tp_settings(void) {
+static void zmk_mouse_ps2_apply_tp_settings_impl(bool from_wake) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
     const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
 
@@ -1917,27 +1926,48 @@ void zmk_mouse_ps2_apply_tp_settings(void) {
         zmk_mouse_ps2_tp_press_to_select_set(true);
     }
 
-    LOG_INF("Applying TP settings: sensitivity=%u inertia=%u value6=%u pts=%u",
-            data->tp_sensitivity, data->tp_neg_inertia, data->tp_value6,
-            data->tp_pts_threshold);
-
-    zmk_mouse_ps2_tp_sensitivity_set(data->tp_sensitivity);
-    zmk_mouse_ps2_tp_neg_inertia_set(data->tp_neg_inertia);
-    zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(data->tp_value6);
-    zmk_mouse_ps2_tp_pts_threshold_set(data->tp_pts_threshold);
+    if (from_wake) {
+        /* Wake path: push the live RAM-cached values back into the TP. */
+        LOG_INF("Wake: restoring TP sensitivity=%u inertia=%u value6=%u pts=%u",
+                data->tp_sensitivity, data->tp_neg_inertia, data->tp_value6,
+                data->tp_pts_threshold);
+        zmk_mouse_ps2_tp_sensitivity_set(data->tp_sensitivity);
+        zmk_mouse_ps2_tp_neg_inertia_set(data->tp_neg_inertia);
+        zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(data->tp_value6);
+        zmk_mouse_ps2_tp_pts_threshold_set(data->tp_pts_threshold);
+    } else {
+        /* Init path: use DTS values (settings_restore will override later). */
+        if (config->tp_press_to_select_threshold != -1) {
+            zmk_mouse_ps2_tp_pts_threshold_set(config->tp_press_to_select_threshold);
+        }
+        if (config->tp_sensitivity != -1) {
+            LOG_INF("Setting TP sensitivity to %d...", config->tp_sensitivity);
+            zmk_mouse_ps2_tp_sensitivity_set(config->tp_sensitivity);
+        }
+        if (config->tp_neg_inertia != -1) {
+            LOG_INF("Setting TP inertia to %d...", config->tp_neg_inertia);
+            zmk_mouse_ps2_tp_neg_inertia_set(config->tp_neg_inertia);
+        }
+        if (config->tp_val6_upper_speed != -1) {
+            LOG_INF("Setting TP value 6 to %d...", config->tp_val6_upper_speed);
+            zmk_mouse_ps2_tp_value6_upper_plateau_speed_set(config->tp_val6_upper_speed);
+        }
+    }
 
     if (config->tp_x_invert) {
-        LOG_INF("Inverting trackpoint x axis.");
         zmk_mouse_ps2_tp_invert_x_set(true);
     }
     if (config->tp_y_invert) {
-        LOG_INF("Inverting trackpoint y axis.");
         zmk_mouse_ps2_tp_invert_y_set(true);
     }
     if (config->tp_xy_swap) {
-        LOG_INF("Swapping trackpoint x and y axis.");
         zmk_mouse_ps2_tp_swap_xy_set(true);
     }
+}
+
+/* Init path wrapper */
+void zmk_mouse_ps2_apply_tp_settings(void) {
+    zmk_mouse_ps2_apply_tp_settings_impl(false);
 }
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING)
@@ -2144,7 +2174,7 @@ int zmk_mouse_ps2_power_up(void) {
     data->wake_up_packets_to_discard = 50;
 
     /* 7. Reapply user configuration that lives in TP RAM. */
-    zmk_mouse_ps2_apply_tp_settings();
+    zmk_mouse_ps2_apply_tp_settings_impl(true);
 
     /* 8. Turn reporting back on. */
     err = zmk_mouse_ps2_activity_reporting_enable();

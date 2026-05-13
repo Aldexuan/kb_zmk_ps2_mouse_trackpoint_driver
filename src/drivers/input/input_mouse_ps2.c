@@ -2062,13 +2062,20 @@ static void zmk_mouse_ps2_transport_suspend(void) {
 #endif
     }
 
-    /* 4. Drive SCL low so it cannot back-feed the TP via ESD diodes.
+    /* 4. Park SCL so it cannot back-feed the TP via ESD diodes.
      *    SCL is an ordinary GPIO owned by the ps2_uart driver, not the
-     *    UART peripheral, so pm_device doesn't touch it. */
+     *    UART peripheral, so pm_device doesn't touch it.
+     *
+     *    IMPORTANT: We use GPIO_DISCONNECTED (input with no pull) rather
+     *    than GPIO_OUTPUT_INACTIVE. On nRF52, any GPIO configured as
+     *    output keeps its port power domain active during System OFF,
+     *    adding ~30µA. Disconnected input draws essentially zero. Since
+     *    VCC is cut right after this, there's no voltage source to
+     *    back-feed through the ESD diodes anyway. */
     if (scl_gpio.port != NULL) {
-        err = gpio_pin_configure_dt(&scl_gpio, GPIO_OUTPUT_INACTIVE);
+        err = gpio_pin_configure_dt(&scl_gpio, GPIO_INPUT | GPIO_PULL_DOWN);
         if (err) {
-            LOG_WRN("SCL low returned %d", err);
+            LOG_WRN("SCL disconnect returned %d", err);
         }
     }
 }

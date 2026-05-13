@@ -2108,7 +2108,6 @@ int zmk_mouse_ps2_power_down(void) {
 
 int zmk_mouse_ps2_power_up(void) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
-    const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
 
     LOG_INF("TrackPoint power-up: leaving idle");
 
@@ -2129,44 +2128,20 @@ int zmk_mouse_ps2_power_up(void) {
         return -EIO;
     }
 
-    /* 5. Send a PS/2 soft-reset (0xFF) to force the TP to redo its
-     *    internal Z-force zero calibration. This is the key step that
-     *    prevents the "cursor drifts to one direction" symptom caused
-     *    by a biased baseline from the initial POR.
-     *
-     *    After 0xFF the TP will:
-     *      - Perform self-test (~300-500ms)
-     *      - Send 0xAA (pass) + 0x00 (device id)
-     *      - Return to reset/stream-off state
-     *
-     *    We consume those response bytes with a bounded read loop. */
-    LOG_INF("Sending PS/2 soft-reset (0xFF) for Z-force recalibration...");
-    zmk_mouse_ps2_reset(config->ps2_device);
+    /* 5. Let the TP settle after POR. The Z-force sensor needs a brief
+     *    period with no mechanical disturbance to establish a stable
+     *    baseline. We do NOT send 0xFF here — a second reset would
+     *    re-trigger calibration and can latch a biased baseline if
+     *    there's any residual vibration or finger contact. */
+    k_sleep(K_MSEC(100));
 
-    /* Wait for the TP to finish its self-test after the soft reset. */
-    k_sleep(K_MSEC(500));
-
-    /* Drain any bytes the TP sent during reset (0xAA, 0x00, or garbage). */
-    {
-        uint8_t dummy;
-        int drained = 0;
-        for (int i = 0; i < 20; i++) {
-            int rc = ps2_read(config->ps2_device, &dummy);
-            if (rc != 0) {
-                break;
-            }
-            drained++;
-            LOG_DBG("Wake drain byte: 0x%02x", dummy);
-        }
-        if (drained > 0) {
-            LOG_INF("Wake drain: consumed %d bytes after soft-reset", drained);
-        }
-    }
-
-    /* 6. Hard-reset the parser state. */
+    /* 6. Hard-reset the parser state and set a generous discard window.
+     *    The first ~30 packets after POR often carry residual drift as
+     *    the TP's internal filter converges. Discarding them prevents
+     *    any visible cursor jump. */
     data->packet_idx = 0;
     memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
-    data->wake_up_packets_to_discard = 30;
+    data->wake_up_packets_to_discard = 50;
 
     /* 7. Reapply user configuration that lives in TP RAM. */
     zmk_mouse_ps2_apply_tp_settings();

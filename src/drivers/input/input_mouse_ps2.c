@@ -2218,6 +2218,24 @@ static void zmk_mouse_ps2_reset_device_work_cb(struct k_work *work) {
 
     LOG_INF("TrackPoint full reset triggered by user");
 
+    /* CRITICAL: Release any mouse buttons that may be "stuck" in the
+     * pressed state due to garbage bytes being interpreted as button
+     * presses during a desync event. If we don't do this, the host
+     * computer will remain in a drag/select state even after the TP
+     * is reset, because it never received the button release event. */
+    if (data->button_l_is_held) {
+        input_report_key(data->dev, INPUT_BTN_0, 0, true, K_FOREVER);
+        data->button_l_is_held = false;
+    }
+    if (data->button_r_is_held) {
+        input_report_key(data->dev, INPUT_BTN_1, 0, true, K_FOREVER);
+        data->button_r_is_held = false;
+    }
+    if (data->button_m_is_held) {
+        input_report_key(data->dev, INPUT_BTN_2, 0, true, K_FOREVER);
+        data->button_m_is_held = false;
+    }
+
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING)
     /* Use the full VCC power cycle path */
     zmk_mouse_ps2_power_down();

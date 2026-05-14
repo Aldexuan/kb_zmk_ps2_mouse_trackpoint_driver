@@ -2200,5 +2200,67 @@ int zmk_mouse_ps2_power_up(void) { return 0; }
 
 #endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING */
 
+/*
+ * Full device reset — callable from any context (key behavior, work queue).
+ * Performs a complete VCC power cycle + POR + re-init, equivalent to
+ * physically unplugging the keyboard and plugging it back in.
+ *
+ * Works regardless of whether IDLE_POWER_SAVING is enabled:
+ * - If enabled: uses the existing power_down/up infrastructure.
+ * - If disabled: does a minimal reset (disable reporting → POR → re-init).
+ */
+static void zmk_mouse_ps2_reset_device_work_cb(struct k_work *work);
+static K_WORK_DEFINE(zmk_mouse_ps2_reset_device_work, zmk_mouse_ps2_reset_device_work_cb);
+
+static void zmk_mouse_ps2_reset_device_work_cb(struct k_work *work) {
+    ARG_UNUSED(work);
+    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+
+    LOG_INF("TrackPoint full reset triggered by user");
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING)
+    /* Use the full VCC power cycle path */
+    zmk_mouse_ps2_power_down();
+    k_sleep(K_MSEC(200)); /* Let TP caps discharge */
+    zmk_mouse_ps2_power_up();
+#else
+    /* No VCC control available; do a software-only reset */
+    const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
+
+    zmk_mouse_ps2_activity_reporting_disable();
+
+    /* Send PS/2 reset command */
+    zmk_mouse_ps2_reset(config->ps2_device);
+    k_sleep(K_MSEC(500));
+
+    /* Re-run POR if RST pin is available */
+    zmk_mouse_ps2_init_power_on_reset();
+
+    /* Re-detect device */
+    int err = zmk_mouse_ps2_init_wait_for_mouse(data->dev);
+    if (err) {
+        LOG_ERR("TP reset: device did not respond");
+    }
+
+    /* Clear parser state */
+    data->packet_idx = 0;
+    memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
+    data->wake_up_packets_to_discard = 50;
+
+    /* Re-apply settings */
+    zmk_mouse_ps2_apply_tp_settings_impl(true);
+
+    /* Re-enable reporting */
+    zmk_mouse_ps2_activity_reporting_enable();
+#endif
+
+    LOG_INF("TrackPoint full reset complete");
+}
+
+int zmk_mouse_ps2_reset_device(void) {
+    k_work_submit(&zmk_mouse_ps2_reset_device_work);
+    return 0;
+}
+
 DEVICE_DT_INST_DEFINE(0, &zmk_mouse_ps2_init, NULL, &zmk_mouse_ps2_data, &zmk_mouse_ps2_config,
                       POST_KERNEL, ZMK_MOUSE_PS2_INIT_PRIORITY, NULL);

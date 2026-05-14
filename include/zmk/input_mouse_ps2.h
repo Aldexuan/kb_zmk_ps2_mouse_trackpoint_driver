@@ -27,3 +27,12 @@ int zmk_mouse_ps2_tp_pts_threshold_change(int amount);
  */
 int zmk_mouse_ps2_power_down(void);
 int zmk_mouse_ps2_power_up(void);
+
+/*
+ * Full device reset: power-cycles the TrackPoint (VCC off → on) and
+ * re-runs the complete initialization sequence (POR, device detection,
+ * settings re-apply). Equivalent to physically unplugging and re-plugging
+ * the keyboard. Use this to recover from any TP anomaly (drift, desync,
+ * no response). Runs on a work queue; safe to call from a key behavior.
+ */
+int zmk_mouse_ps2_reset_device(void);

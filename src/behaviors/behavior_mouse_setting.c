@@ -72,6 +72,9 @@ static int on_keymap_binding_pressed(struct zmk_behavior_binding *binding,
         return zmk_mouse_ps2_tp_pts_threshold_change(INCREMENT_TP_PTS_THRESHOLD);
     case MS_TP_PTS_THRESHOLD_DECR:
         return zmk_mouse_ps2_tp_pts_threshold_change(-INCREMENT_TP_PTS_THRESHOLD);
+
+    case MS_TP_RESET:
+        return zmk_mouse_ps2_reset_device();
     }
 
     return -ENOTSUP;

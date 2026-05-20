@@ -570,6 +570,38 @@ void zmk_mouse_ps2_activity_move_mouse(int16_t mov_x, int16_t mov_y) {
         return;
     }
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_ACCEL)
+    /* MCU-side non-linear acceleration.
+     *
+     * Inspired by the exponential curve in trackpoint_0x15.c (I2C driver).
+     * That driver uses expf(speed * k); we replicate the effect using pure
+     * integer arithmetic since nRF52 has no hardware FPU.
+     *
+     * Formula: mult_pct = 100 + dist * FACTOR
+     *   dist     = |dx| + |dy|  (Manhattan length of the packet vector)
+     *   FACTOR   = CONFIG_ZMK_INPUT_MOUSE_PS2_ACCEL_FACTOR   (default 8)
+     *   cap      = CONFIG_ZMK_INPUT_MOUSE_PS2_ACCEL_MAX_MULT_PCT (default 250)
+     *
+     * Example (FACTOR=8, cap=250):
+     *   dist= 2 (very light) → 1.16x
+     *   dist= 5 (light)      → 1.40x
+     *   dist=10 (medium)     → 1.80x
+     *   dist=19 (strong)     → 2.52x → capped at 2.50x
+     *
+     * Scaling is applied to the integer values directly; the >>7 shift
+     * (divide-by-128) keeps the multiply-accumulate in 32-bit range. */
+    {
+        int dist = abs((int)mov_x) + abs((int)mov_y);
+        int mult_pct = 100 + dist * CONFIG_ZMK_INPUT_MOUSE_PS2_ACCEL_FACTOR;
+        if (mult_pct > CONFIG_ZMK_INPUT_MOUSE_PS2_ACCEL_MAX_MULT_PCT) {
+            mult_pct = CONFIG_ZMK_INPUT_MOUSE_PS2_ACCEL_MAX_MULT_PCT;
+        }
+        /* Apply multiplier: val * mult_pct / 100 using 32-bit intermediates */
+        mov_x = (int16_t)(((int32_t)mov_x * mult_pct) / 100);
+        mov_y = (int16_t)(((int32_t)mov_y * mult_pct) / 100);
+    }
+#endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_ACCEL */
+
     bool have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
     bool have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
 

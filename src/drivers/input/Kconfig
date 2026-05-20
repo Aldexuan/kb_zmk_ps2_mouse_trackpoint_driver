@@ -30,6 +30,42 @@ config ZMK_INPUT_MOUSE_PS2_ENABLE_ERROR_MITIGATION
     bool "Tries to mitigate transmission errors. Only useful when using a PS2 driver that is prone to miscommunication like the GPIO bitbanging driver."
 	default n
 
+config ZMK_INPUT_MOUSE_PS2_ACCEL
+    bool "Enable MCU-side non-linear acceleration for the PS/2 pointing device"
+    default n
+    help
+      Adds a velocity-based acceleration multiplier on top of the TrackPoint's
+      built-in algorithm. As input magnitude increases, the effective cursor
+      speed scales non-linearly. This means a light touch stays precise while
+      a moderate push covers large distances quickly, reducing finger fatigue.
+      Inspired by the exponential acceleration used in trackpoint_0x15.c (I2C
+      variant). Implemented with integer arithmetic only (no FPU required).
+
+config ZMK_INPUT_MOUSE_PS2_ACCEL_FACTOR
+    int "Acceleration factor (steepness of the curve, per input-unit)"
+    depends on ZMK_INPUT_MOUSE_PS2_ACCEL
+    default 8
+    range 1 30
+    help
+      Controls how aggressively speed increases with input magnitude.
+      mult_pct = 100 + (dist * FACTOR), capped at ACCEL_MAX_MULT_PCT.
+      dist = abs(dx) + abs(dy) per PS/2 packet (typically 2-30 for a TP).
+      Examples with default FACTOR=8:
+        dist=5  (light)  → 1.4x
+        dist=10 (medium) → 1.8x
+        dist=20 (strong) → 2.6x (capped by ACCEL_MAX_MULT_PCT)
+      Increase for a more aggressive curve; decrease for a gentler one.
+
+config ZMK_INPUT_MOUSE_PS2_ACCEL_MAX_MULT_PCT
+    int "Maximum acceleration multiplier (in percent, e.g. 250 = 2.5x)"
+    depends on ZMK_INPUT_MOUSE_PS2_ACCEL
+    default 250
+    range 110 500
+    help
+      Upper bound for the acceleration multiplier. 250 means the cursor can
+      move at most 2.5x faster than the raw TP output for any given packet.
+      Higher values allow more aggressive acceleration for fast movements.
+
 config ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING
     bool "Automatically power down the PS/2 pointing device when ZMK goes idle"
     default n

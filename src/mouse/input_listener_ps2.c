@@ -63,6 +63,9 @@ struct input_listener_ps2_data {
     // Scroll accumulator for smooth scrolling with dynamic divisor
     int16_t scroll_residue_x;
     int16_t scroll_residue_y;
+
+    // Watchdog: timestamp of last scroll activity, for residue timeout
+    int64_t scroll_last_activity_ms;
 };
 
 struct input_listener_ps2_config {
@@ -82,6 +85,9 @@ struct input_listener_ps2_config {
     int scroll_divisor_fast;
     int scroll_input_max;
     bool scroll_dominant_axis;
+    /* Snipe (slow precision) mode */
+    int snipe_layer;
+    int snipe_divisor;
 };
 
 void zmk_input_listener_ps2_layer_toggle_input_rel_received(
@@ -195,6 +201,14 @@ static void filter_with_input_config(const struct input_listener_ps2_config *cfg
 
     evt->value = (int16_t)((evt->value * cfg->scale_multiplier) / cfg->scale_divisor);
 
+    /* Snipe mode: when snipe-layer is the highest active layer, slow down cursor.
+     * Applied after scale, before scroll conversion. Scroll layer takes precedence. */
+    if (cfg->snipe_layer >= 0 &&
+        zmk_keymap_highest_layer_active() == cfg->snipe_layer &&
+        (cfg->scroll_layer < 0 || zmk_keymap_highest_layer_active() != cfg->scroll_layer)) {
+        int div = cfg->snipe_divisor > 0 ? cfg->snipe_divisor : 2;
+        evt->value = (int16_t)(evt->value / div);
+    }
 
     if (cfg->scroll_layer >=0 && zmk_keymap_highest_layer_active() == cfg->scroll_layer) {
         int16_t original_val = evt->value;
@@ -266,6 +280,17 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
             int16_t sx = data->mouse.wheel_data.x;
             int16_t sy = data->mouse.wheel_data.y;
 
+            /* --- Watchdog: clear residues if idle too long --- */
+            int64_t now_ms = k_uptime_get();
+            if (data->scroll_last_activity_ms > 0 &&
+                (now_ms - data->scroll_last_activity_ms) > CONFIG_ZMK_INPUT_MOUSE_PS2_SCROLL_WDT_MS) {
+                LOG_DBG("Scroll watchdog: clearing residues after %lldms idle",
+                        now_ms - data->scroll_last_activity_ms);
+                data->scroll_residue_x = 0;
+                data->scroll_residue_y = 0;
+            }
+            data->scroll_last_activity_ms = now_ms;
+
             /* Dominant axis locking */
             if (config->scroll_dominant_axis) {
                 int abs_sx = abs(sx);
@@ -280,7 +305,8 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
                 }
             }
 
-            /* Process each scroll axis with deadzone + dynamic divisor + accumulator */
+            /* Process each scroll axis with:
+             *   deadzone → watchdog/damping → quadratic divisor → accumulator */
             int16_t scroll_out_x = 0;
             int16_t scroll_out_y = 0;
 
@@ -288,14 +314,21 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
             {
                 int abs_val = abs(sx);
                 if (abs_val <= config->scroll_deadzone) {
-                    data->scroll_residue_x = 0;
+                    /* Below deadzone: apply damping (3/4 decay) instead of hard zero.
+                     * This prevents residual value from triggering on the next noise packet. */
+                    data->scroll_residue_x = (data->scroll_residue_x * 3) / 4;
                 } else {
                     if (abs_val > config->scroll_input_max) {
                         abs_val = config->scroll_input_max;
                     }
+                    /* Quadratic divisor curve: t² instead of linear t.
+                     * slow end stays gentle, fast end drops steeply.
+                     * t_num = abs_val²,  t_denom = input_max²  (both fit int32) */
+                    int32_t t_num   = (int32_t)abs_val * abs_val;
+                    int32_t t_denom = (int32_t)config->scroll_input_max * config->scroll_input_max;
                     int divisor = config->scroll_divisor_slow -
-                        ((config->scroll_divisor_slow - config->scroll_divisor_fast) * abs_val)
-                        / config->scroll_input_max;
+                        (int)(((int32_t)(config->scroll_divisor_slow - config->scroll_divisor_fast)
+                               * t_num) / t_denom);
                     if (divisor < 1) divisor = 1;
 
                     data->scroll_residue_x += sx;
@@ -303,6 +336,8 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
                     if (scroll_out_x != 0) {
                         data->scroll_residue_x %= divisor;
                     }
+                    /* Damping on remainder to bleed off residue when motion stops */
+                    data->scroll_residue_x = (data->scroll_residue_x * 3) / 4;
                 }
             }
 
@@ -310,14 +345,16 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
             {
                 int abs_val = abs(sy);
                 if (abs_val <= config->scroll_deadzone) {
-                    data->scroll_residue_y = 0;
+                    data->scroll_residue_y = (data->scroll_residue_y * 3) / 4;
                 } else {
                     if (abs_val > config->scroll_input_max) {
                         abs_val = config->scroll_input_max;
                     }
+                    int32_t t_num   = (int32_t)abs_val * abs_val;
+                    int32_t t_denom = (int32_t)config->scroll_input_max * config->scroll_input_max;
                     int divisor = config->scroll_divisor_slow -
-                        ((config->scroll_divisor_slow - config->scroll_divisor_fast) * abs_val)
-                        / config->scroll_input_max;
+                        (int)(((int32_t)(config->scroll_divisor_slow - config->scroll_divisor_fast)
+                               * t_num) / t_denom);
                     if (divisor < 1) divisor = 1;
 
                     data->scroll_residue_y += sy;
@@ -325,6 +362,7 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
                     if (scroll_out_y != 0) {
                         data->scroll_residue_y %= divisor;
                     }
+                    data->scroll_residue_y = (data->scroll_residue_y * 3) / 4;
                 }
             }
 
@@ -475,6 +513,8 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                             .scroll_divisor_fast = DT_INST_PROP(n, scroll_divisor_fast),           \
                             .scroll_input_max = DT_INST_PROP(n, scroll_input_max),                 \
                             .scroll_dominant_axis = DT_INST_PROP(n, scroll_dominant_axis),          \
+                            .snipe_layer = DT_INST_PROP(n, snipe_layer),                           \
+                            .snipe_divisor = DT_INST_PROP(n, snipe_divisor),                       \
                         };                                                                         \
                     static struct input_listener_ps2_data data_##n =                               \
                         {                                                                          \
@@ -483,6 +523,7 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                             .layer_toggle_last_mouse_package_time = 0,                             \
                             .scroll_residue_x = 0,                                                 \
                             .scroll_residue_y = 0,                                                 \
+                            .scroll_last_activity_ms = 0,                                          \
                         };                                                                         \
                     void input_handler_ps2_##n(struct input_event *evt) {                          \
                         input_handler_ps2(&config_##n, &data_##n, evt);                            \

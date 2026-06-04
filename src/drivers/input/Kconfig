@@ -90,4 +90,15 @@ config ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING_WAKE_DELAY_MS
       Shorter values (e.g. 50ms) can cause the calibration to latch a biased
       baseline, which presents as the cursor continuously drifting after wake.
 
+config ZMK_INPUT_MOUSE_PS2_SCROLL_WDT_MS
+    int "Scroll accumulator watchdog timeout in milliseconds"
+    default 200
+    range 50 5000
+    help
+      If no scroll activity is received for this many milliseconds, the scroll
+      residue accumulators (X and Y) are cleared to zero. This prevents stale
+      residue from the previous scroll session triggering an unexpected tick on
+      the next interaction. 200ms is a good default; increase if you want residue
+      to persist longer between slow scroll bursts.
+
 endif # ZMK_INPUT_MOUSE_PS2

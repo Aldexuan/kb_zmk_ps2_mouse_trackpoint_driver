@@ -36,3 +36,12 @@ int zmk_mouse_ps2_power_up(void);
  * no response). Runs on a work queue; safe to call from a key behavior.
  */
 int zmk_mouse_ps2_reset_device(void);
+
+/*
+ * Slow mode control: reduces cursor movement speed by half when enabled.
+ * Useful for precise positioning tasks (e.g., pixel-perfect alignment).
+ * These functions are safe to call from a key behavior.
+ */
+int zmk_mouse_ps2_slow_mode_toggle(void);
+int zmk_mouse_ps2_slow_mode_set(bool enable);
+

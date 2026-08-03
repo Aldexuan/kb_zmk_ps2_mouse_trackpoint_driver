@@ -66,6 +66,9 @@ struct input_listener_ps2_data {
 
     // Watchdog: timestamp of last scroll activity, for residue timeout
     int64_t scroll_last_activity_ms;
+
+    // Slow mode: when enabled, cursor movement speed is halved for precise positioning
+    bool slow_mode_enabled;
 };
 
 struct input_listener_ps2_config {
@@ -385,7 +388,16 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
         }
 
         if (data->mouse.data.mode == INPUT_LISTENER_XY_DATA_MODE_REL) {
-            zmk_hid_mouse_movement_set(data->mouse.data.x, data->mouse.data.y);
+            int16_t move_x = data->mouse.data.x;
+            int16_t move_y = data->mouse.data.y;
+            
+            // Apply slow mode: halve the cursor speed when enabled
+            if (data->slow_mode_enabled) {
+                move_x /= 2;
+                move_y /= 2;
+            }
+            
+            zmk_hid_mouse_movement_set(move_x, move_y);
         }
 
         if (data->mouse.button_set != 0) {
@@ -524,6 +536,7 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                             .scroll_residue_x = 0,                                                 \
                             .scroll_residue_y = 0,                                                 \
                             .scroll_last_activity_ms = 0,                                          \
+                            .slow_mode_enabled = false,                                            \
                         };                                                                         \
                     void input_handler_ps2_##n(struct input_event *evt) {                          \
                         input_handler_ps2(&config_##n, &data_##n, evt);                            \
@@ -545,3 +558,56 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                 ())
 
 DT_INST_FOREACH_STATUS_OKAY(IL_INST)
+
+
+/*
+ * Slow mode control API
+ */
+
+#if VALID_LISTENER_COUNT > 0
+
+// Get the first valid listener data (we only support one PS/2 mouse device)
+static struct input_listener_ps2_data *get_listener_data(void) {
+#define GET_DATA(n)                                                                                \
+    COND_CODE_1(DT_NODE_HAS_STATUS(DT_INST_PHANDLE(n, device), okay), (return &data_##n;), ())
+    DT_INST_FOREACH_STATUS_OKAY(GET_DATA)
+#undef GET_DATA
+    return NULL;
+}
+
+int zmk_mouse_ps2_slow_mode_toggle(void) {
+    struct input_listener_ps2_data *data = get_listener_data();
+    if (data == NULL) {
+        LOG_ERR("No valid PS/2 input listener found");
+        return -ENODEV;
+    }
+    
+    data->slow_mode_enabled = !data->slow_mode_enabled;
+    LOG_INF("Slow mode %s", data->slow_mode_enabled ? "enabled" : "disabled");
+    return 0;
+}
+
+int zmk_mouse_ps2_slow_mode_set(bool enable) {
+    struct input_listener_ps2_data *data = get_listener_data();
+    if (data == NULL) {
+        LOG_ERR("No valid PS/2 input listener found");
+        return -ENODEV;
+    }
+    
+    data->slow_mode_enabled = enable;
+    LOG_INF("Slow mode %s", enable ? "enabled" : "disabled");
+    return 0;
+}
+
+#else
+
+// Stub implementations when no PS/2 listener is configured
+int zmk_mouse_ps2_slow_mode_toggle(void) {
+    return -ENOTSUP;
+}
+
+int zmk_mouse_ps2_slow_mode_set(bool enable) {
+    return -ENOTSUP;
+}
+
+#endif // VALID_LISTENER_COUNT > 0

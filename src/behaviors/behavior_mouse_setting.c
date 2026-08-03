@@ -27,6 +27,10 @@ static const struct behavior_parameter_value_metadata mms_param_values[] = {
     // VALUE6 调节（可根据实际含义修改display_name）
     {.display_name = "MaxSpeed+", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE, .value = MS_TP_VALUE6_INCR},
     {.display_name = "MaxSpeed-", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE, .value = MS_TP_VALUE6_DECR},
+    // Slow Mode 控制
+    {.display_name = "SlowToggle", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE, .value = MS_TP_SLOW_MODE_TOGGLE},
+    {.display_name = "SlowOn", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE, .value = MS_TP_SLOW_MODE_ON},
+    {.display_name = "SlowOff", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE, .value = MS_TP_SLOW_MODE_OFF},
 };
 
 // 参数元数据集（ZMK 标准单集合写法）
@@ -75,6 +79,13 @@ static int on_keymap_binding_pressed(struct zmk_behavior_binding *binding,
 
     case MS_TP_RESET:
         return zmk_mouse_ps2_reset_device();
+
+    case MS_TP_SLOW_MODE_TOGGLE:
+        return zmk_mouse_ps2_slow_mode_toggle();
+    case MS_TP_SLOW_MODE_ON:
+        return zmk_mouse_ps2_slow_mode_set(true);
+    case MS_TP_SLOW_MODE_OFF:
+        return zmk_mouse_ps2_slow_mode_set(false);
     }
 
     return -ENOTSUP;

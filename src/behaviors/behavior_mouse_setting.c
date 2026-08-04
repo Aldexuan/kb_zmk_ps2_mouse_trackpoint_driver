@@ -31,6 +31,9 @@ static const struct behavior_parameter_value_metadata mms_param_values[] = {
     {.display_name = "SlowToggle", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE, .value = MS_TP_SLOW_MODE_TOGGLE},
     {.display_name = "SlowOn", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE, .value = MS_TP_SLOW_MODE_ON},
     {.display_name = "SlowOff", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE, .value = MS_TP_SLOW_MODE_OFF},
+    // 滚动速度调节
+    {.display_name = "ScrollSpeed+", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE, .value = MS_SCROLL_SPEED_INCR},
+    {.display_name = "ScrollSpeed-", .type = BEHAVIOR_PARAMETER_VALUE_TYPE_VALUE, .value = MS_SCROLL_SPEED_DECR},
 };
 
 // 参数元数据集（ZMK 标准单集合写法）
@@ -86,6 +89,11 @@ static int on_keymap_binding_pressed(struct zmk_behavior_binding *binding,
         return zmk_mouse_ps2_slow_mode_set(true);
     case MS_TP_SLOW_MODE_OFF:
         return zmk_mouse_ps2_slow_mode_set(false);
+    
+    case MS_SCROLL_SPEED_INCR:
+        return zmk_mouse_ps2_scroll_speed_adjust(-5);  // Negative = faster (decrease divisor)
+    case MS_SCROLL_SPEED_DECR:
+        return zmk_mouse_ps2_scroll_speed_adjust(+5);  // Positive = slower (increase divisor)
     }
 
     return -ENOTSUP;

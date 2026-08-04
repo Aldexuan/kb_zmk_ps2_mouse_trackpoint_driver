@@ -69,6 +69,11 @@ struct input_listener_ps2_data {
 
     // Slow mode: when enabled, cursor movement speed is halved for precise positioning
     bool slow_mode_enabled;
+    
+    // Runtime adjustable scroll speed (stored as divisor adjustment)
+    // Positive = slower scroll, negative = faster scroll
+    // Range: -50 to +50, default: 0
+    int16_t scroll_speed_adjustment;
 };
 
 struct input_listener_ps2_config {
@@ -329,8 +334,19 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
                      * t_num = abs_val²,  t_denom = input_max²  (both fit int32) */
                     int32_t t_num   = (int32_t)abs_val * abs_val;
                     int32_t t_denom = (int32_t)config->scroll_input_max * config->scroll_input_max;
-                    int divisor = config->scroll_divisor_slow -
-                        (int)(((int32_t)(config->scroll_divisor_slow - config->scroll_divisor_fast)
+                    
+                    /* Apply runtime scroll speed adjustment to base divisor values */
+                    int base_divisor_slow = config->scroll_divisor_slow + data->scroll_speed_adjustment;
+                    int base_divisor_fast = config->scroll_divisor_fast + data->scroll_speed_adjustment;
+                    
+                    /* Clamp divisor values to safe ranges */
+                    if (base_divisor_slow < 10) base_divisor_slow = 10;
+                    if (base_divisor_fast < 5) base_divisor_fast = 5;
+                    if (base_divisor_slow > 200) base_divisor_slow = 200;
+                    if (base_divisor_fast > 100) base_divisor_fast = 100;
+                    
+                    int divisor = base_divisor_slow -
+                        (int)(((int32_t)(base_divisor_slow - base_divisor_fast)
                                * t_num) / t_denom);
                     if (divisor < 1) divisor = 1;
 
@@ -355,8 +371,19 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
                     }
                     int32_t t_num   = (int32_t)abs_val * abs_val;
                     int32_t t_denom = (int32_t)config->scroll_input_max * config->scroll_input_max;
-                    int divisor = config->scroll_divisor_slow -
-                        (int)(((int32_t)(config->scroll_divisor_slow - config->scroll_divisor_fast)
+                    
+                    /* Apply runtime scroll speed adjustment to base divisor values */
+                    int base_divisor_slow = config->scroll_divisor_slow + data->scroll_speed_adjustment;
+                    int base_divisor_fast = config->scroll_divisor_fast + data->scroll_speed_adjustment;
+                    
+                    /* Clamp divisor values to safe ranges */
+                    if (base_divisor_slow < 10) base_divisor_slow = 10;
+                    if (base_divisor_fast < 5) base_divisor_fast = 5;
+                    if (base_divisor_slow > 200) base_divisor_slow = 200;
+                    if (base_divisor_fast > 100) base_divisor_fast = 100;
+                    
+                    int divisor = base_divisor_slow -
+                        (int)(((int32_t)(base_divisor_slow - base_divisor_fast)
                                * t_num) / t_denom);
                     if (divisor < 1) divisor = 1;
 
@@ -537,6 +564,7 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                             .scroll_residue_y = 0,                                                 \
                             .scroll_last_activity_ms = 0,                                          \
                             .slow_mode_enabled = false,                                            \
+                            .scroll_speed_adjustment = 0,                                          \
                         };                                                                         \
                     void input_handler_ps2_##n(struct input_event *evt) {                          \
                         input_handler_ps2(&config_##n, &data_##n, evt);                            \
@@ -599,6 +627,32 @@ int zmk_mouse_ps2_slow_mode_set(bool enable) {
     return 0;
 }
 
+int zmk_mouse_ps2_scroll_speed_adjust(int amount) {
+    struct input_listener_ps2_data *data = get_listener_data();
+    if (data == NULL) {
+        LOG_ERR("No valid PS/2 input listener found");
+        return -ENODEV;
+    }
+    
+    int16_t new_adjustment = data->scroll_speed_adjustment + amount;
+    
+    // Limit range to -50 to +50
+    if (new_adjustment < -50) {
+        new_adjustment = -50;
+        LOG_WRN("Scroll speed adjustment reached minimum (-50)");
+    } else if (new_adjustment > 50) {
+        new_adjustment = 50;
+        LOG_WRN("Scroll speed adjustment reached maximum (+50)");
+    }
+    
+    data->scroll_speed_adjustment = new_adjustment;
+    
+    LOG_INF("Scroll speed adjustment: %+d (positive = slower, negative = faster)", 
+            new_adjustment);
+    
+    return 0;
+}
+
 #else
 
 // Stub implementations when no PS/2 listener is configured
@@ -607,6 +661,10 @@ int zmk_mouse_ps2_slow_mode_toggle(void) {
 }
 
 int zmk_mouse_ps2_slow_mode_set(bool enable) {
+    return -ENOTSUP;
+}
+
+int zmk_mouse_ps2_scroll_speed_adjust(int amount) {
     return -ENOTSUP;
 }
 

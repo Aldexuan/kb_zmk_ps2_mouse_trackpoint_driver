@@ -45,3 +45,12 @@ int zmk_mouse_ps2_reset_device(void);
 int zmk_mouse_ps2_slow_mode_toggle(void);
 int zmk_mouse_ps2_slow_mode_set(bool enable);
 
+/*
+ * Scroll speed adjustment: dynamically adjust scroll speed at runtime.
+ * Positive amount = slower scroll (increase divisor)
+ * Negative amount = faster scroll (decrease divisor)
+ * Range: -50 to +50 (relative to DTS configured divisor values)
+ * The adjustment is applied to both slow and fast divisors.
+ */
+int zmk_mouse_ps2_scroll_speed_adjust(int amount);
+

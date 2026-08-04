@@ -351,9 +351,12 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
                     if (divisor < 1) divisor = 1;
 
                     data->scroll_residue_x += sx;
-                    /* Prevent negative accumulator to avoid reverse-direction jitter */
-                    if (data->scroll_residue_x < 0) {
-                        LOG_DBG("X residue went negative (%d), clearing", data->scroll_residue_x);
+                    /* Prevent sign change to avoid reverse-direction jitter:
+                     * If input and accumulator have opposite signs, clear accumulator */
+                    if ((sx > 0 && data->scroll_residue_x < 0) || 
+                        (sx < 0 && data->scroll_residue_x > 0)) {
+                        LOG_DBG("X residue sign mismatch (input=%d, residue=%d), clearing", 
+                                sx, data->scroll_residue_x);
                         data->scroll_residue_x = 0;
                     }
                     scroll_out_x = data->scroll_residue_x / divisor;
@@ -393,9 +396,12 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
                     if (divisor < 1) divisor = 1;
 
                     data->scroll_residue_y += sy;
-                    /* Prevent negative accumulator to avoid reverse-direction jitter */
-                    if (data->scroll_residue_y < 0) {
-                        LOG_DBG("Y residue went negative (%d), clearing", data->scroll_residue_y);
+                    /* Prevent sign change to avoid reverse-direction jitter:
+                     * If input and accumulator have opposite signs, clear accumulator */
+                    if ((sy > 0 && data->scroll_residue_y < 0) || 
+                        (sy < 0 && data->scroll_residue_y > 0)) {
+                        LOG_DBG("Y residue sign mismatch (input=%d, residue=%d), clearing", 
+                                sy, data->scroll_residue_y);
                         data->scroll_residue_y = 0;
                     }
                     scroll_out_y = data->scroll_residue_y / divisor;

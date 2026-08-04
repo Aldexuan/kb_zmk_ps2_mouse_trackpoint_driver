@@ -351,6 +351,11 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
                     if (divisor < 1) divisor = 1;
 
                     data->scroll_residue_x += sx;
+                    /* Prevent negative accumulator to avoid reverse-direction jitter */
+                    if (data->scroll_residue_x < 0) {
+                        LOG_DBG("X residue went negative (%d), clearing", data->scroll_residue_x);
+                        data->scroll_residue_x = 0;
+                    }
                     scroll_out_x = data->scroll_residue_x / divisor;
                     if (scroll_out_x != 0) {
                         data->scroll_residue_x %= divisor;
@@ -388,6 +393,11 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
                     if (divisor < 1) divisor = 1;
 
                     data->scroll_residue_y += sy;
+                    /* Prevent negative accumulator to avoid reverse-direction jitter */
+                    if (data->scroll_residue_y < 0) {
+                        LOG_DBG("Y residue went negative (%d), clearing", data->scroll_residue_y);
+                        data->scroll_residue_y = 0;
+                    }
                     scroll_out_y = data->scroll_residue_y / divisor;
                     if (scroll_out_y != 0) {
                         data->scroll_residue_y %= divisor;

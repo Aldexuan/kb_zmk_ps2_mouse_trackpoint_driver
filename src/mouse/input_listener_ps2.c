@@ -74,6 +74,9 @@ struct input_listener_ps2_data {
     // Positive = slower scroll, negative = faster scroll
     // Range: -50 to +50, default: 0
     int16_t scroll_speed_adjustment;
+    
+    // Track previous layer for detecting scroll layer entry (smooth scrolling)
+    int prev_scroll_layer;
 };
 
 struct input_listener_ps2_config {
@@ -288,6 +291,17 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
             int16_t sx = data->mouse.wheel_data.x;
             int16_t sy = data->mouse.wheel_data.y;
 
+            /* --- Clear residues when entering scroll layer for smooth start --- */
+            int current_layer = zmk_keymap_highest_layer_active();
+            if (data->prev_scroll_layer != current_layer) {
+                if (current_layer == config->scroll_layer) {
+                    LOG_DBG("Entering scroll layer, clearing residues");
+                    data->scroll_residue_x = 0;
+                    data->scroll_residue_y = 0;
+                }
+                data->prev_scroll_layer = current_layer;
+            }
+
             /* --- Watchdog: clear residues if idle too long --- */
             int64_t now_ms = k_uptime_get();
             if (data->scroll_last_activity_ms > 0 &&
@@ -350,13 +364,13 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
                                * t_num) / t_denom);
                     if (divisor < 1) divisor = 1;
 
+                    int16_t old_residue_x = data->scroll_residue_x;
                     data->scroll_residue_x += sx;
-                    /* Prevent sign change to avoid reverse-direction jitter:
-                     * If input and accumulator have opposite signs, clear accumulator */
-                    if ((sx > 0 && data->scroll_residue_x < 0) || 
-                        (sx < 0 && data->scroll_residue_x > 0)) {
-                        LOG_DBG("X residue sign mismatch (input=%d, residue=%d), clearing", 
-                                sx, data->scroll_residue_x);
+                    /* Prevent residue from crossing zero to avoid reverse jitter */
+                    if ((old_residue_x > 0 && data->scroll_residue_x < 0) ||
+                        (old_residue_x < 0 && data->scroll_residue_x > 0)) {
+                        LOG_DBG("X residue crossed zero (was %d, input %d), capping at zero",
+                                old_residue_x, sx);
                         data->scroll_residue_x = 0;
                     }
                     scroll_out_x = data->scroll_residue_x / divisor;
@@ -395,13 +409,13 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
                                * t_num) / t_denom);
                     if (divisor < 1) divisor = 1;
 
+                    int16_t old_residue_y = data->scroll_residue_y;
                     data->scroll_residue_y += sy;
-                    /* Prevent sign change to avoid reverse-direction jitter:
-                     * If input and accumulator have opposite signs, clear accumulator */
-                    if ((sy > 0 && data->scroll_residue_y < 0) || 
-                        (sy < 0 && data->scroll_residue_y > 0)) {
-                        LOG_DBG("Y residue sign mismatch (input=%d, residue=%d), clearing", 
-                                sy, data->scroll_residue_y);
+                    /* Prevent residue from crossing zero to avoid reverse jitter */
+                    if ((old_residue_y > 0 && data->scroll_residue_y < 0) ||
+                        (old_residue_y < 0 && data->scroll_residue_y > 0)) {
+                        LOG_DBG("Y residue crossed zero (was %d, input %d), capping at zero",
+                                old_residue_y, sy);
                         data->scroll_residue_y = 0;
                     }
                     scroll_out_y = data->scroll_residue_y / divisor;
@@ -410,6 +424,49 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
                     }
                     data->scroll_residue_y = (data->scroll_residue_y * 3) / 4;
                 }
+            }
+
+            /* --- Clamp output per frame for smooth scrolling --- */
+            const int16_t MAX_SCROLL_PER_FRAME = 2;
+            const int16_t MAX_RESIDUE_ALLOWED = 60;
+            
+            // X axis clamping
+            if (scroll_out_x > MAX_SCROLL_PER_FRAME) {
+                int16_t excess = scroll_out_x - MAX_SCROLL_PER_FRAME;
+                // Only put excess back if residue won't overflow
+                if (abs(data->scroll_residue_x + excess) <= MAX_RESIDUE_ALLOWED) {
+                    data->scroll_residue_x += excess;
+                } else {
+                    LOG_DBG("X residue would overflow, discarding excess");
+                }
+                scroll_out_x = MAX_SCROLL_PER_FRAME;
+            } else if (scroll_out_x < -MAX_SCROLL_PER_FRAME) {
+                int16_t excess = scroll_out_x + MAX_SCROLL_PER_FRAME;
+                if (abs(data->scroll_residue_x + excess) <= MAX_RESIDUE_ALLOWED) {
+                    data->scroll_residue_x += excess;
+                } else {
+                    LOG_DBG("X residue would overflow, discarding excess");
+                }
+                scroll_out_x = -MAX_SCROLL_PER_FRAME;
+            }
+            
+            // Y axis clamping
+            if (scroll_out_y > MAX_SCROLL_PER_FRAME) {
+                int16_t excess = scroll_out_y - MAX_SCROLL_PER_FRAME;
+                if (abs(data->scroll_residue_y + excess) <= MAX_RESIDUE_ALLOWED) {
+                    data->scroll_residue_y += excess;
+                } else {
+                    LOG_DBG("Y residue would overflow, discarding excess");
+                }
+                scroll_out_y = MAX_SCROLL_PER_FRAME;
+            } else if (scroll_out_y < -MAX_SCROLL_PER_FRAME) {
+                int16_t excess = scroll_out_y + MAX_SCROLL_PER_FRAME;
+                if (abs(data->scroll_residue_y + excess) <= MAX_RESIDUE_ALLOWED) {
+                    data->scroll_residue_y += excess;
+                } else {
+                    LOG_DBG("Y residue would overflow, discarding excess");
+                }
+                scroll_out_y = -MAX_SCROLL_PER_FRAME;
             }
 
             if (scroll_out_x != 0 || scroll_out_y != 0) {
@@ -581,6 +638,7 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                             .scroll_last_activity_ms = 0,                                          \
                             .slow_mode_enabled = false,                                            \
                             .scroll_speed_adjustment = 0,                                          \
+                            .prev_scroll_layer = -1,                                               \
                         };                                                                         \
                     void input_handler_ps2_##n(struct input_event *evt) {                          \
                         input_handler_ps2(&config_##n, &data_##n, evt);                            \

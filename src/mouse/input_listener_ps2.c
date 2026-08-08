@@ -328,57 +328,68 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
             }
 
             /* Process each scroll axis with:
-             *   deadzone → watchdog/damping → quadratic divisor → accumulator */
+             *   deadzone → watchdog/damping → hybrid divisor → accumulator */
             int16_t scroll_out_x = 0;
             int16_t scroll_out_y = 0;
+            
+            /* Save actual divisor for accurate unit conversion in clamping */
+            int actual_divisor_x = 1;
+            int actual_divisor_y = 1;
+            
+            /* Calculate base divisor boundaries */
+            int base_divisor_slow = config->scroll_divisor_slow + data->scroll_speed_adjustment;
+            int base_divisor_fast = config->scroll_divisor_fast + data->scroll_speed_adjustment;
+            
+            /* Clamp divisor values to safe ranges */
+            if (base_divisor_slow < 10) base_divisor_slow = 10;
+            if (base_divisor_fast < 5) base_divisor_fast = 5;
+            if (base_divisor_slow > 200) base_divisor_slow = 200;
+            if (base_divisor_fast > 100) base_divisor_fast = 100;
 
             /* --- X axis (horizontal scroll) --- */
             {
                 int abs_val = abs(sx);
                 if (abs_val <= config->scroll_deadzone) {
-                    /* Below deadzone: apply damping (3/4 decay) instead of hard zero.
-                     * This prevents residual value from triggering on the next noise packet. */
+                    /* Below deadzone: apply damping (3/4 decay) only when no input.
+                     * This prevents residual value from triggering on noise. */
                     data->scroll_residue_x = (data->scroll_residue_x * 3) / 4;
                 } else {
                     if (abs_val > config->scroll_input_max) {
                         abs_val = config->scroll_input_max;
                     }
-                    /* Quadratic divisor curve: t² instead of linear t.
-                     * slow end stays gentle, fast end drops steeply.
-                     * t_num = abs_val²,  t_denom = input_max²  (both fit int32) */
-                    int32_t t_num   = (int32_t)abs_val * abs_val;
-                    int32_t t_denom = (int32_t)config->scroll_input_max * config->scroll_input_max;
                     
-                    /* Apply runtime scroll speed adjustment to base divisor values */
-                    int base_divisor_slow = config->scroll_divisor_slow + data->scroll_speed_adjustment;
-                    int base_divisor_fast = config->scroll_divisor_fast + data->scroll_speed_adjustment;
+                    /* Hybrid divisor curve: 50% Linear + 50% Quadratic
+                     * Reduces high-speed explosion while maintaining responsiveness */
+                    int32_t max_val = config->scroll_input_max;
+                    int32_t t_linear = abs_val;
+                    int32_t t_quad = ((int32_t)abs_val * abs_val) / max_val;
+                    int32_t t_hybrid = (t_linear + t_quad) / 2;
                     
-                    /* Clamp divisor values to safe ranges */
-                    if (base_divisor_slow < 10) base_divisor_slow = 10;
-                    if (base_divisor_fast < 5) base_divisor_fast = 5;
-                    if (base_divisor_slow > 200) base_divisor_slow = 200;
-                    if (base_divisor_fast > 100) base_divisor_fast = 100;
-                    
-                    int divisor = base_divisor_slow -
-                        (int)(((int32_t)(base_divisor_slow - base_divisor_fast)
-                               * t_num) / t_denom);
-                    if (divisor < 1) divisor = 1;
+                    actual_divisor_x = base_divisor_slow -
+                        (int)(((int32_t)(base_divisor_slow - base_divisor_fast) * t_hybrid) / max_val);
+                    if (actual_divisor_x < 1) actual_divisor_x = 1;
 
                     int16_t old_residue_x = data->scroll_residue_x;
                     data->scroll_residue_x += sx;
-                    /* Prevent residue from crossing zero to avoid reverse jitter */
+                    
+                    /* Progressive zero-crossing protection:
+                     * Large residue (>15): clear immediately for fast direction change
+                     * Small residue (≤15): keep value to avoid noise-induced clearing */
                     if ((old_residue_x > 0 && data->scroll_residue_x < 0) ||
                         (old_residue_x < 0 && data->scroll_residue_x > 0)) {
-                        LOG_DBG("X residue crossed zero (was %d, input %d), capping at zero",
-                                old_residue_x, sx);
-                        data->scroll_residue_x = 0;
+                        if (abs(old_residue_x) > 15) {
+                            LOG_DBG("X residue crossed zero (was %d, input %d), clearing",
+                                    old_residue_x, sx);
+                            data->scroll_residue_x = 0;
+                        }
+                        /* Small residue: keep value, let it evolve naturally */
                     }
-                    scroll_out_x = data->scroll_residue_x / divisor;
+                    
+                    scroll_out_x = data->scroll_residue_x / actual_divisor_x;
                     if (scroll_out_x != 0) {
-                        data->scroll_residue_x %= divisor;
+                        data->scroll_residue_x %= actual_divisor_x;
                     }
-                    /* Damping on remainder to bleed off residue when motion stops */
-                    data->scroll_residue_x = (data->scroll_residue_x * 3) / 4;
+                    /* NOTE: No damping when there's input (KEY FIX for light-push responsiveness) */
                 }
             }
 
@@ -386,85 +397,106 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
             {
                 int abs_val = abs(sy);
                 if (abs_val <= config->scroll_deadzone) {
+                    /* Below deadzone: apply damping (3/4 decay) only when no input */
                     data->scroll_residue_y = (data->scroll_residue_y * 3) / 4;
                 } else {
                     if (abs_val > config->scroll_input_max) {
                         abs_val = config->scroll_input_max;
                     }
-                    int32_t t_num   = (int32_t)abs_val * abs_val;
-                    int32_t t_denom = (int32_t)config->scroll_input_max * config->scroll_input_max;
                     
-                    /* Apply runtime scroll speed adjustment to base divisor values */
-                    int base_divisor_slow = config->scroll_divisor_slow + data->scroll_speed_adjustment;
-                    int base_divisor_fast = config->scroll_divisor_fast + data->scroll_speed_adjustment;
+                    /* Hybrid divisor curve: 50% Linear + 50% Quadratic
+                     * Reduces high-speed explosion while maintaining responsiveness */
+                    int32_t max_val = config->scroll_input_max;
+                    int32_t t_linear = abs_val;
+                    int32_t t_quad = ((int32_t)abs_val * abs_val) / max_val;
+                    int32_t t_hybrid = (t_linear + t_quad) / 2;
                     
-                    /* Clamp divisor values to safe ranges */
-                    if (base_divisor_slow < 10) base_divisor_slow = 10;
-                    if (base_divisor_fast < 5) base_divisor_fast = 5;
-                    if (base_divisor_slow > 200) base_divisor_slow = 200;
-                    if (base_divisor_fast > 100) base_divisor_fast = 100;
-                    
-                    int divisor = base_divisor_slow -
-                        (int)(((int32_t)(base_divisor_slow - base_divisor_fast)
-                               * t_num) / t_denom);
-                    if (divisor < 1) divisor = 1;
+                    actual_divisor_y = base_divisor_slow -
+                        (int)(((int32_t)(base_divisor_slow - base_divisor_fast) * t_hybrid) / max_val);
+                    if (actual_divisor_y < 1) actual_divisor_y = 1;
 
                     int16_t old_residue_y = data->scroll_residue_y;
                     data->scroll_residue_y += sy;
-                    /* Prevent residue from crossing zero to avoid reverse jitter */
+                    
+                    /* Progressive zero-crossing protection:
+                     * Large residue (>15): clear immediately for fast direction change
+                     * Small residue (≤15): keep value to avoid noise-induced clearing */
                     if ((old_residue_y > 0 && data->scroll_residue_y < 0) ||
                         (old_residue_y < 0 && data->scroll_residue_y > 0)) {
-                        LOG_DBG("Y residue crossed zero (was %d, input %d), capping at zero",
-                                old_residue_y, sy);
-                        data->scroll_residue_y = 0;
+                        if (abs(old_residue_y) > 15) {
+                            LOG_DBG("Y residue crossed zero (was %d, input %d), clearing",
+                                    old_residue_y, sy);
+                            data->scroll_residue_y = 0;
+                        }
+                        /* Small residue: keep value, let it evolve naturally */
                     }
-                    scroll_out_y = data->scroll_residue_y / divisor;
+                    
+                    scroll_out_y = data->scroll_residue_y / actual_divisor_y;
                     if (scroll_out_y != 0) {
-                        data->scroll_residue_y %= divisor;
+                        data->scroll_residue_y %= actual_divisor_y;
                     }
-                    data->scroll_residue_y = (data->scroll_residue_y * 3) / 4;
+                    /* NOTE: No damping when there's input (KEY FIX for light-push responsiveness) */
                 }
             }
 
-            /* --- Clamp output per frame for smooth scrolling --- */
+            /* --- Clamp output per frame for smooth scrolling with unit-accurate truncation --- */
             const int16_t MAX_SCROLL_PER_FRAME = 2;
-            const int16_t MAX_RESIDUE_ALLOWED = 60;
+            const int16_t MAX_RESIDUE_ALLOWED = 200;  /* Optimized: allows divisor≤50, excess≤4 */
             
-            // X axis clamping
+            // X axis clamping with truncation (not discard)
             if (scroll_out_x > MAX_SCROLL_PER_FRAME) {
                 int16_t excess = scroll_out_x - MAX_SCROLL_PER_FRAME;
-                // Only put excess back if residue won't overflow
-                if (abs(data->scroll_residue_x + excess) <= MAX_RESIDUE_ALLOWED) {
-                    data->scroll_residue_x += excess;
+                /* KEY FIX: Convert output units back to input units using actual_divisor_x */
+                int32_t target_residue = (int32_t)data->scroll_residue_x + (excess * actual_divisor_x);
+                
+                /* Truncate to upper limit instead of silently discarding */
+                if (target_residue > MAX_RESIDUE_ALLOWED) {
+                    data->scroll_residue_x = MAX_RESIDUE_ALLOWED;
+                    LOG_DBG("X residue truncated to %d (target was %d)", 
+                            MAX_RESIDUE_ALLOWED, (int)target_residue);
                 } else {
-                    LOG_DBG("X residue would overflow, discarding excess");
+                    data->scroll_residue_x = (int16_t)target_residue;
                 }
                 scroll_out_x = MAX_SCROLL_PER_FRAME;
             } else if (scroll_out_x < -MAX_SCROLL_PER_FRAME) {
-                int16_t excess = scroll_out_x + MAX_SCROLL_PER_FRAME;
-                if (abs(data->scroll_residue_x + excess) <= MAX_RESIDUE_ALLOWED) {
-                    data->scroll_residue_x += excess;
+                int16_t excess = scroll_out_x + MAX_SCROLL_PER_FRAME;  /* negative */
+                int32_t target_residue = (int32_t)data->scroll_residue_x + (excess * actual_divisor_x);
+                
+                if (target_residue < -MAX_RESIDUE_ALLOWED) {
+                    data->scroll_residue_x = -MAX_RESIDUE_ALLOWED;
+                    LOG_DBG("X residue truncated to %d (target was %d)", 
+                            -MAX_RESIDUE_ALLOWED, (int)target_residue);
                 } else {
-                    LOG_DBG("X residue would overflow, discarding excess");
+                    data->scroll_residue_x = (int16_t)target_residue;
                 }
                 scroll_out_x = -MAX_SCROLL_PER_FRAME;
             }
             
-            // Y axis clamping
+            // Y axis clamping with truncation (not discard)
             if (scroll_out_y > MAX_SCROLL_PER_FRAME) {
                 int16_t excess = scroll_out_y - MAX_SCROLL_PER_FRAME;
-                if (abs(data->scroll_residue_y + excess) <= MAX_RESIDUE_ALLOWED) {
-                    data->scroll_residue_y += excess;
+                /* KEY FIX: Convert output units back to input units using actual_divisor_y */
+                int32_t target_residue = (int32_t)data->scroll_residue_y + (excess * actual_divisor_y);
+                
+                /* Truncate to upper limit instead of silently discarding */
+                if (target_residue > MAX_RESIDUE_ALLOWED) {
+                    data->scroll_residue_y = MAX_RESIDUE_ALLOWED;
+                    LOG_DBG("Y residue truncated to %d (target was %d)", 
+                            MAX_RESIDUE_ALLOWED, (int)target_residue);
                 } else {
-                    LOG_DBG("Y residue would overflow, discarding excess");
+                    data->scroll_residue_y = (int16_t)target_residue;
                 }
                 scroll_out_y = MAX_SCROLL_PER_FRAME;
             } else if (scroll_out_y < -MAX_SCROLL_PER_FRAME) {
-                int16_t excess = scroll_out_y + MAX_SCROLL_PER_FRAME;
-                if (abs(data->scroll_residue_y + excess) <= MAX_RESIDUE_ALLOWED) {
-                    data->scroll_residue_y += excess;
+                int16_t excess = scroll_out_y + MAX_SCROLL_PER_FRAME;  /* negative */
+                int32_t target_residue = (int32_t)data->scroll_residue_y + (excess * actual_divisor_y);
+                
+                if (target_residue < -MAX_RESIDUE_ALLOWED) {
+                    data->scroll_residue_y = -MAX_RESIDUE_ALLOWED;
+                    LOG_DBG("Y residue truncated to %d (target was %d)", 
+                            -MAX_RESIDUE_ALLOWED, (int)target_residue);
                 } else {
-                    LOG_DBG("Y residue would overflow, discarding excess");
+                    data->scroll_residue_y = (int16_t)target_residue;
                 }
                 scroll_out_y = -MAX_SCROLL_PER_FRAME;
             }

@@ -1349,6 +1349,7 @@ int zmk_mouse_ps2_tp_sensitivity_change(int amount) {
     
     // Accumulate adjustment (supports rapid key presses)
     pending_sensitivity_change += amount;
+    int total_pending = pending_sensitivity_change;  // Save for logging
     
     k_mutex_unlock(&sensitivity_adjustment_mutex);
     
@@ -1356,7 +1357,7 @@ int zmk_mouse_ps2_tp_sensitivity_change(int amount) {
     k_work_submit(&sensitivity_adjustment_work);
     
     LOG_DBG("Submitted sensitivity adjustment: %+d (async, total pending: %+d)", 
-            amount, pending_sensitivity_change);
+            amount, total_pending);
     return 0;
 }
 

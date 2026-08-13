@@ -81,32 +81,6 @@ K_TIMER_DEFINE(ps2_automouse_timer, ps2_deactivate_automouse_layer, NULL);
 
 /* Timer callback: deactivate layer after timeout */
 static void ps2_deactivate_automouse_layer(struct k_timer *timer) {
-    /* ⭐ Sticky Key Protection: Check if any keys are currently pressed
-     * 
-     * Problem: If a key is pressed when the layer deactivates, the key release
-     * event will be interpreted on the wrong layer, causing the key to stick.
-     * 
-     * Solution: Don't deactivate if there was recent input activity.
-     * Wait for keys to be released before closing the layer.
-     */
-    
-    // Check if there was any input in the last 100ms
-    // (This gives time for key press/release cycles to complete)
-    extern int64_t zmk_last_input_activity_time(void);  // ZMK internal function
-    int64_t now = k_uptime_get();
-    int64_t last_activity = zmk_last_input_activity_time();
-    
-    if (last_activity > 0 && (now - last_activity) < 100) {
-        // Recent input detected, delay deactivation to avoid key sticking
-        LOG_DBG("PS/2: Delaying auto-mouse layer deactivation (recent input: %lldms ago)",
-                now - last_activity);
-        
-        // Restart timer for another 100ms
-        k_timer_start(&ps2_automouse_timer, K_MSEC(100), K_NO_WAIT);
-        return;
-    }
-    
-    // Safe to deactivate now
     ps2_automouse_triggered = false;
     zmk_keymap_layer_deactivate(AUTOMOUSE_LAYER);
     LOG_INF("PS/2: Auto-mouse layer %d deactivated (timeout)", AUTOMOUSE_LAYER);

@@ -73,6 +73,12 @@ static const struct input_listener_ps2_config *ps2_global_config = NULL;
 /* Global state */
 static bool ps2_automouse_triggered = false;
 
+/* Forward declaration of timer callback */
+static void ps2_deactivate_automouse_layer(struct k_timer *timer);
+
+/* Define kernel timer (this creates the timer object automatically) */
+K_TIMER_DEFINE(ps2_automouse_timer, ps2_deactivate_automouse_layer, NULL);
+
 /* Timer callback: deactivate layer after timeout */
 static void ps2_deactivate_automouse_layer(struct k_timer *timer) {
     /* ⭐ Sticky Key Protection: Check if any keys are currently pressed
@@ -105,9 +111,6 @@ static void ps2_deactivate_automouse_layer(struct k_timer *timer) {
     zmk_keymap_layer_deactivate(AUTOMOUSE_LAYER);
     LOG_INF("PS/2: Auto-mouse layer %d deactivated (timeout)", AUTOMOUSE_LAYER);
 }
-
-/* Define kernel timer (this creates the timer object automatically) */
-K_TIMER_DEFINE(ps2_automouse_timer, ps2_deactivate_automouse_layer, NULL);
 
 /* Activate layer and start/restart timer */
 static void ps2_activate_automouse_layer(void) {

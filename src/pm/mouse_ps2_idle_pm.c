@@ -70,7 +70,13 @@ static int mouse_ps2_activity_listener(const zmk_event_t *eh) {
 
     switch (ev->state) {
     case ZMK_ACTIVITY_ACTIVE:
-        k_work_submit(&mouse_ps2_power_up_work);
+        /* Route to the driver's dedicated PS/2 maintenance queue, NOT the
+         * system work queue. power_up() blocks for ~1s (WAKE_DELAY + 600ms POR
+         * + device re-detect + TP re-config). On the system work queue that
+         * would stall ZMK's keyboard input pipeline and delay the key-up of
+         * the very key that woke the board, causing the host to fire typematic
+         * auto-repeat ("first key repeats on idle wake"). */
+        zmk_mouse_ps2_submit_work(&mouse_ps2_power_up_work);
         break;
     case ZMK_ACTIVITY_IDLE:
     case ZMK_ACTIVITY_SLEEP:
@@ -78,7 +84,7 @@ static int mouse_ps2_activity_listener(const zmk_event_t *eh) {
          * deep sleep path. We still queue power_down so that the
          * driver's internal state (packet buffer, reporting flag)
          * is reset and on resume we go through the full POR cycle. */
-        k_work_submit(&mouse_ps2_power_down_work);
+        zmk_mouse_ps2_submit_work(&mouse_ps2_power_down_work);
         break;
     default:
         break;

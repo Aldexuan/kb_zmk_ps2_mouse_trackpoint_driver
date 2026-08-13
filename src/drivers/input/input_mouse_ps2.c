@@ -174,6 +174,53 @@ static K_MUTEX_DEFINE(sensitivity_adjustment_mutex);
 static void zmk_mouse_ps2_sensitivity_adjustment_work_handler(struct k_work *work);
 static K_WORK_DEFINE(sensitivity_adjustment_work, zmk_mouse_ps2_sensitivity_adjustment_work_handler);
 
+/* ============================================================================
+ * ⭐⭐⭐ Dedicated work queue for blocking PS/2 maintenance work
+ * ============================================================================
+ * Every "heavy" PS/2 operation — idle power-up/down, full device reset and
+ * runtime sensitivity/scroll adjustments — performs blocking k_sleep() and
+ * blocking PS/2 read/write (each byte can take tens to hundreds of ms, and
+ * the wake POR sequence sleeps 600ms+). These MUST NOT run on the Zephyr
+ * system work queue, because ZMK's keyboard input pipeline (kscan -> position
+ * event -> keymap -> HID) also runs there. If the system work queue is blocked
+ * for ~1s during an idle->active wake, the *release* of the very key that woke
+ * the board gets stuck behind it, the host never sees the key-up in time and
+ * fires typematic auto-repeat (the "first key repeats/stuck on idle wake" bug).
+ *
+ * A single dedicated, single-threaded queue is used so all PS/2 maintenance
+ * work is serialized (they all talk to the same device and must not overlap),
+ * while leaving the system work queue free to service keyboard input.
+ *
+ * Priority is intentionally *below* the system work queue (which defaults to a
+ * cooperative priority): these operations spend most of their time sleeping /
+ * waiting for the device anyway, so a low preemptible priority guarantees that
+ * key scanning always wins the CPU.
+ */
+#define MOUSE_PS2_WORK_QUEUE_STACK_SIZE 2048
+#define MOUSE_PS2_WORK_QUEUE_PRIORITY 10
+
+K_THREAD_STACK_DEFINE(zmk_mouse_ps2_work_queue_stack, MOUSE_PS2_WORK_QUEUE_STACK_SIZE);
+static struct k_work_q zmk_mouse_ps2_work_queue;
+static bool zmk_mouse_ps2_work_queue_ready = false;
+
+/*
+ * Submit a work item to the dedicated PS/2 maintenance queue.
+ *
+ * Falls back to the system work queue only if the dedicated queue has not been
+ * started yet (should never happen in practice: the queue is started during
+ * device init at POST_KERNEL, long before any activity-state change or user
+ * reset can occur). Exposed via input_mouse_ps2.h so the idle-PM glue module
+ * can share the same queue.
+ */
+int zmk_mouse_ps2_submit_work(struct k_work *work) {
+    if (zmk_mouse_ps2_work_queue_ready) {
+        return k_work_submit_to_queue(&zmk_mouse_ps2_work_queue, work);
+    }
+
+    LOG_WRN("PS/2 work queue not ready yet; falling back to system work queue");
+    return k_work_submit(work);
+}
+
 typedef enum {
     MOUSE_PS2_PACKET_MODE_PS2_DEFAULT,
     MOUSE_PS2_PACKET_MODE_SCROLL,
@@ -1317,7 +1364,8 @@ int zmk_mouse_ps2_tp_sensitivity_set(int sensitivity) {
 /* ============================================================================
  * Async Sensitivity Adjustment Work Handler
  * ============================================================================
- * Executes in system work queue, blocking is allowed here.
+ * Executes on the dedicated PS/2 maintenance work queue, blocking is allowed
+ * here (and kept off the system work queue that drives keyboard input).
  */
 static void zmk_mouse_ps2_sensitivity_adjustment_work_handler(struct k_work *work) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
@@ -1353,8 +1401,10 @@ int zmk_mouse_ps2_tp_sensitivity_change(int amount) {
     
     k_mutex_unlock(&sensitivity_adjustment_mutex);
     
-    // Submit to system work queue (returns immediately)
-    k_work_submit(&sensitivity_adjustment_work);
+    // Submit to the dedicated PS/2 maintenance queue (returns immediately).
+    // This blocks on PS/2 writes (10-20ms), so it must not run on the system
+    // work queue where it would compete with keyboard input processing.
+    zmk_mouse_ps2_submit_work(&sensitivity_adjustment_work);
     
     LOG_DBG("Submitted sensitivity adjustment: %+d (async, total pending: %+d)", 
             amount, total_pending);
@@ -1754,6 +1804,15 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused);
 
 static int zmk_mouse_ps2_init(const struct device *dev) {
     LOG_DBG("Inside zmk_mouse_ps2_init");
+
+    /* Start the dedicated PS/2 maintenance work queue before anything can
+     * submit to it. Runs at POST_KERNEL, well ahead of any activity-state
+     * change or user-triggered reset. */
+    k_work_queue_start(&zmk_mouse_ps2_work_queue, zmk_mouse_ps2_work_queue_stack,
+                       K_THREAD_STACK_SIZEOF(zmk_mouse_ps2_work_queue_stack),
+                       MOUSE_PS2_WORK_QUEUE_PRIORITY, NULL);
+    k_thread_name_set(&zmk_mouse_ps2_work_queue.thread, "mouse_ps2_wq");
+    zmk_mouse_ps2_work_queue_ready = true;
 
     LOG_DBG("Creating mouse_ps2 init thread.");
     k_thread_create(&zmk_mouse_ps2_data.thread, zmk_mouse_ps2_data.thread_stack,
@@ -2256,7 +2315,24 @@ int zmk_mouse_ps2_power_up(void) {
      *    there's any residual vibration or finger contact. */
     k_sleep(K_MSEC(100));
 
-    /* 6. Hard-reset the parser state and set a generous discard window.
+    /* 6. Release any mouse buttons that may be stuck in the pressed
+     *    state. This prevents drift caused by the parser thinking a
+     *    button is still held (e.g., from garbage bytes before sleep
+     *    or interrupted packet sequences). */
+    if (data->button_l_is_held) {
+        input_report_key(data->dev, INPUT_BTN_0, 0, true, K_FOREVER);
+        data->button_l_is_held = false;
+    }
+    if (data->button_r_is_held) {
+        input_report_key(data->dev, INPUT_BTN_1, 0, true, K_FOREVER);
+        data->button_r_is_held = false;
+    }
+    if (data->button_m_is_held) {
+        input_report_key(data->dev, INPUT_BTN_2, 0, true, K_FOREVER);
+        data->button_m_is_held = false;
+    }
+
+    /* 7. Hard-reset the parser state and set a generous discard window.
      *    The first ~30 packets after POR often carry residual drift as
      *    the TP's internal filter converges. Discarding them prevents
      *    any visible cursor jump. */
@@ -2264,10 +2340,10 @@ int zmk_mouse_ps2_power_up(void) {
     memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
     data->wake_up_packets_to_discard = 50;
 
-    /* 7. Reapply user configuration that lives in TP RAM. */
+    /* 8. Reapply user configuration that lives in TP RAM. */
     zmk_mouse_ps2_apply_tp_settings_impl(true);
 
-    /* 8. Turn reporting back on. */
+    /* 9. Turn reporting back on. */
     err = zmk_mouse_ps2_activity_reporting_enable();
     if (err) {
         LOG_ERR("Could not re-enable reporting after wake: %d", err);
@@ -2360,7 +2436,9 @@ static void zmk_mouse_ps2_reset_device_work_cb(struct k_work *work) {
 }
 
 int zmk_mouse_ps2_reset_device(void) {
-    k_work_submit(&zmk_mouse_ps2_reset_device_work);
+    /* Runs the full VCC power-cycle + POR (~1s of blocking work). Route it to
+     * the dedicated queue so it never stalls keyboard input. */
+    zmk_mouse_ps2_submit_work(&zmk_mouse_ps2_reset_device_work);
     return 0;
 }
 

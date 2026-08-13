@@ -29,6 +29,16 @@ int zmk_mouse_ps2_power_down(void);
 int zmk_mouse_ps2_power_up(void);
 
 /*
+ * Submits a work item onto the driver's dedicated PS/2 maintenance work queue
+ * (single-threaded, low priority). All blocking PS/2 operations (idle
+ * power-up/down, full device reset, runtime setting adjustments) must run here
+ * instead of the Zephyr system work queue, so they never block ZMK's keyboard
+ * input pipeline. Safe to call from any thread context.
+ */
+struct k_work;
+int zmk_mouse_ps2_submit_work(struct k_work *work);
+
+/*
  * Full device reset: power-cycles the TrackPoint (VCC off → on) and
  * re-runs the complete initialization sequence (POR, device detection,
  * settings re-apply). Equivalent to physically unplugging and re-plugging

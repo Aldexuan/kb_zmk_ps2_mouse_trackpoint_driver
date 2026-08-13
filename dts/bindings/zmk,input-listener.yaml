@@ -19,21 +19,6 @@ properties:
   scale-divisor:
     type: int
     default: 1
-  layer-toggle:
-    type: int
-    default: -1
-    required: false
-    description: The layer that should be toggled when the mouse is moved.
-  layer-toggle-delay-ms:
-    type: int
-    default: 250
-    required: false
-    description: How many miliseconds of mouse activity are required before the layer is toggled on.
-  layer-toggle-timeout-ms:
-    type: int
-    default: 250
-    required: false
-    description: How many miliseconds of mouse inactivity are required before the layer is toggled off again.
   scroll-layer:
     type: int
     default: -1
@@ -100,3 +85,86 @@ properties:
     description: |
       Divisor applied to cursor movement in snipe mode. Default 2 = half speed.
       Range 2-8. Higher values = slower / more precise.
+  scroll-mode-key-position:
+    type: int
+    default: -1
+    required: false
+    description: |
+      ⭐ RECOMMENDED MODE: Key position that activates scroll mode when pressed (zero-latency).
+      When set (>= 0), this takes priority over scroll-layer.
+      
+      Example: scroll-mode-key-position = <61>;  // Space key
+      
+      Advantages over scroll-layer:
+      - Zero latency (no 250ms delay)
+      - No key-sticking issues (state perfectly synced)
+      - More responsive user experience
+      
+      To find key position: count from top-left (0-indexed), left-to-right, top-to-bottom.
+      Set to -1 (default) to disable and fall back to scroll-layer mode.
+  snipe-mode-key-position:
+    type: int
+    default: -1
+    required: false
+    description: |
+      ⭐ RECOMMENDED MODE: Key position that activates snipe mode when pressed (zero-latency).
+      When set (>= 0), this takes priority over snipe-layer.
+      
+      Example: snipe-mode-key-position = <36>;  // Some modifier key
+      
+      Advantages over snipe-layer:
+      - Zero latency (no layer switching delay)
+      - No key-sticking issues
+      - Instant precision mode activation
+      
+      Set to -1 (default) to disable and fall back to snipe-layer mode.
+  automouse-layer:
+    type: int
+    default: -1
+    required: false
+    description: |
+      ⭐ AUTO-MOUSE LAYER: Automatically activate a layer on mouse movement (PMW3610-style).
+      
+      The layer index that should be automatically activated when mouse movement is
+      detected, and deactivated after a timeout period of inactivity.
+      
+      This uses a Zephyr kernel timer for efficient, precise timing.
+      
+      Set to -1 (default) to disable.
+      Set to a valid layer index (0-N) to enable.
+      
+      Example: automouse-layer = <6>;  // Auto-activate Layer 6
+      
+      Related properties:
+      - automouse-timeout-ms: Timeout before deactivation (default 250ms)
+      - automouse-threshold: Movement threshold for activation (default 5)
+      
+      Implementation: Uses k_timer API for efficient kernel-level timing.
+  automouse-timeout-ms:
+    type: int
+    default: 250
+    required: false
+    description: |
+      Auto-mouse layer timeout in milliseconds.
+      
+      Time after the last mouse movement before the auto-mouse layer
+      is automatically deactivated.
+      
+      Default: 250ms
+      Range: 100-5000ms recommended
+      
+      Example: automouse-timeout-ms = <500>;  // 500ms timeout
+  automouse-threshold:
+    type: int
+    default: 5
+    required: false
+    description: |
+      Movement threshold for auto-mouse layer activation.
+      
+      Minimum movement magnitude (abs(x) + abs(y)) required to trigger
+      auto-mouse layer activation. Lower values = more sensitive.
+      
+      Default: 5
+      Range: 1-50 recommended
+      
+      Example: automouse-threshold = <3>;  // More sensitive

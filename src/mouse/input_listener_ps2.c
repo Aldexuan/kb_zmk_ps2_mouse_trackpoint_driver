@@ -19,6 +19,8 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/keymap.h>
 #include <zmk/pointing.h>
 #include <zmk/hid.h>
+#include <zmk/events/position_state_changed.h>
+#include <zmk/event_manager.h>
 
 #define ZMK_MOUSE_HID_NUM_BUTTONS 5
 
@@ -28,6 +30,74 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define VALID_LISTENER_COUNT (DT_INST_FOREACH_STATUS_OKAY(ONE_IF_DEV_OK) 0)
 
 #if VALID_LISTENER_COUNT > 0
+
+/* ============================================================================
+ * ⭐⭐⭐ Global state variables for zero-latency mode control
+ * ============================================================================
+ * These variables are directly updated by Position Changed events, providing
+ * instant state synchronization without any delay.
+ * 
+ * Architecture:
+ * - ps2_scroll_mode_key_pressed: True when scroll mode key is held
+ * - ps2_snipe_mode_key_pressed: True when snipe mode key is held
+ * - ps2_global_config: Reference to config for event listener access
+ * 
+ * Thread Safety:
+ * - Position Changed events are single-threaded in ZMK event system
+ * - No mutex needed, reads/writes are atomic bool operations
+ */
+static bool ps2_scroll_mode_key_pressed = false;
+static bool ps2_snipe_mode_key_pressed = false;
+static const struct input_listener_ps2_config *ps2_global_config = NULL;
+
+/* ============================================================================
+ * ⭐⭐⭐ Auto-Mouse Layer using Kernel Timer (PMW3610-style)
+ * ============================================================================
+ * Automatically activates a layer when mouse movement is detected,
+ * and deactivates after a timeout period of inactivity.
+ * 
+ * Implementation uses Zephyr kernel timer for efficient, precise timing.
+ * 
+ * Configuration (DTS):
+ * - automouse-layer: Layer index to activate (-1 = disabled)
+ * - automouse-timeout-ms: Timeout before deactivation (default 250ms)
+ * - automouse-threshold: Movement threshold for activation (default 5)
+ */
+
+#define AUTOMOUSE_LAYER (DT_INST_PROP(0, automouse_layer))
+#define AUTOMOUSE_TIMEOUT_MS (DT_INST_PROP(0, automouse_timeout_ms))
+#define AUTOMOUSE_THRESHOLD (DT_INST_PROP(0, automouse_threshold))
+
+#if AUTOMOUSE_LAYER >= 0
+
+/* Global timer and state */
+static struct k_timer ps2_automouse_timer;
+static bool ps2_automouse_triggered = false;
+
+/* Timer callback: deactivate layer after timeout */
+static void ps2_deactivate_automouse_layer(struct k_timer *timer) {
+    ps2_automouse_triggered = false;
+    zmk_keymap_layer_deactivate(AUTOMOUSE_LAYER);
+    LOG_INF("PS/2: Auto-mouse layer %d deactivated (timeout)", AUTOMOUSE_LAYER);
+}
+
+/* Define kernel timer */
+K_TIMER_DEFINE(ps2_automouse_timer, ps2_deactivate_automouse_layer, NULL);
+
+/* Activate layer and start/restart timer */
+static void ps2_activate_automouse_layer(void) {
+    if (!ps2_automouse_triggered) {
+        LOG_INF("PS/2: Auto-mouse layer %d activated", AUTOMOUSE_LAYER);
+    }
+    
+    ps2_automouse_triggered = true;
+    zmk_keymap_layer_activate(AUTOMOUSE_LAYER);
+    
+    /* Start/restart timer (automatically cancels previous timer) */
+    k_timer_start(&ps2_automouse_timer, K_MSEC(AUTOMOUSE_TIMEOUT_MS), K_NO_WAIT);
+}
+
+#endif // AUTOMOUSE_LAYER >= 0
 
 enum input_listener_ps2_xy_data_mode {
     INPUT_LISTENER_XY_DATA_MODE_NONE,
@@ -54,10 +124,6 @@ struct input_listener_ps2_data {
         } mouse;
     };
 
-    bool layer_toggle_layer_enabled;
-    int64_t layer_toggle_last_mouse_package_time;
-    struct k_work_delayable layer_toggle_activation_delay;
-    struct k_work_delayable layer_toggle_deactivation_delay;
     int64_t last_scroll_report_time;
 
     // Scroll accumulator for smooth scrolling with dynamic divisor
@@ -85,9 +151,12 @@ struct input_listener_ps2_config {
     bool y_invert;
     uint16_t scale_multiplier;
     uint16_t scale_divisor;
-    int layer_toggle;
-    int layer_toggle_delay_ms;
-    int layer_toggle_timeout_ms;
+    
+    /* Key-position based mode control (recommended, zero-latency) */
+    int scroll_mode_key_position;  // -1 = disabled, >= 0 = key position
+    int snipe_mode_key_position;   // -1 = disabled, >= 0 = key position
+    
+    /* Layer-based mode control (fallback) */
     int scroll_layer;
     int scroll_speed_num;
     int scroll_speed_den;
@@ -96,13 +165,11 @@ struct input_listener_ps2_config {
     int scroll_divisor_fast;
     int scroll_input_max;
     bool scroll_dominant_axis;
+    
     /* Snipe (slow precision) mode */
     int snipe_layer;
     int snipe_divisor;
 };
-
-void zmk_input_listener_ps2_layer_toggle_input_rel_received(
-    const struct input_listener_ps2_config *config, struct input_listener_ps2_data *data);
 
 static char *get_input_code_name(struct input_event *evt) {
     switch (evt->code) {
@@ -196,6 +263,68 @@ static inline bool is_y_data(const struct input_event *evt) {
     return evt->type == INPUT_EV_REL && evt->code == INPUT_REL_Y;
 }
 
+/* ============================================================================
+ * ⭐⭐⭐ Position Changed Event Listener (Zero-Latency Mode Control)
+ * ============================================================================
+ * This listener directly subscribes to ZMK's position_state_changed events,
+ * providing instant state updates when mode control keys are pressed/released.
+ * 
+ * Priority: This runs BEFORE layer system updates, ensuring zero-latency.
+ * 
+ * Event Flow:
+ * 1. User presses key at position X
+ * 2. ZMK fires position_state_changed event
+ * 3. This listener updates global state variables (immediate)
+ * 4. ZMK layer system processes the key (may have delay)
+ * 5. Next mouse input reads global state (already updated!)
+ * 
+ * Thread Safety: ZMK event system is single-threaded, no race conditions.
+ */
+static int ps2_mode_key_listener(const zmk_event_t *eh) {
+    const struct zmk_position_state_changed *ev = as_zmk_position_state_changed(eh);
+    if (!ev) {
+        return ZMK_EV_EVENT_BUBBLE;  // Not our event, continue propagation
+    }
+    
+    if (!ps2_global_config) {
+        return ZMK_EV_EVENT_BUBBLE;  // Config not initialized yet, skip
+    }
+    
+    /* ⭐ Scroll Mode Key Detection */
+    if (ps2_global_config->scroll_mode_key_position >= 0 &&
+        ev->position == ps2_global_config->scroll_mode_key_position) {
+        
+        bool old_state = ps2_scroll_mode_key_pressed;
+        ps2_scroll_mode_key_pressed = ev->state;
+        
+        if (old_state != ev->state) {
+            LOG_INF("PS/2: Scroll mode key %s (position %d)", 
+                    ev->state ? "PRESSED" : "RELEASED",
+                    ev->position);
+        }
+    }
+    
+    /* ⭐ Snipe Mode Key Detection */
+    if (ps2_global_config->snipe_mode_key_position >= 0 &&
+        ev->position == ps2_global_config->snipe_mode_key_position) {
+        
+        bool old_state = ps2_snipe_mode_key_pressed;
+        ps2_snipe_mode_key_pressed = ev->state;
+        
+        if (old_state != ev->state) {
+            LOG_INF("PS/2: Snipe mode key %s (position %d)", 
+                    ev->state ? "PRESSED" : "RELEASED",
+                    ev->position);
+        }
+    }
+    
+    return ZMK_EV_EVENT_BUBBLE;  // Continue event propagation (don't block)
+}
+
+/* ⭐⭐⭐ Register listener to ZMK event system */
+ZMK_LISTENER(ps2_mode_key_listener, ps2_mode_key_listener);
+ZMK_SUBSCRIPTION(ps2_mode_key_listener, zmk_position_state_changed);
+
 static void filter_with_input_config(const struct input_listener_ps2_config *cfg,
                                      struct input_event *evt) {
     if (!evt->dev) {
@@ -212,16 +341,64 @@ static void filter_with_input_config(const struct input_listener_ps2_config *cfg
 
     evt->value = (int16_t)((evt->value * cfg->scale_multiplier) / cfg->scale_divisor);
 
-    /* Snipe mode: when snipe-layer is the highest active layer, slow down cursor.
-     * Applied after scale, before scroll conversion. Scroll layer takes precedence. */
-    if (cfg->snipe_layer >= 0 &&
-        zmk_keymap_highest_layer_active() == cfg->snipe_layer &&
-        (cfg->scroll_layer < 0 || zmk_keymap_highest_layer_active() != cfg->scroll_layer)) {
+    /* ============================================================================
+     * ⭐⭐⭐ Snipe Mode: Slow down cursor for precise targeting
+     * ============================================================================
+     * Priority Logic:
+     * 1. If snipe-mode-key-position is configured (>= 0): use global variable (RECOMMENDED)
+     * 2. Else: fall back to snipe-layer check (legacy mode)
+     * 
+     * Applied after scale, before scroll conversion. Scroll mode takes precedence.
+     */
+    bool in_snipe_mode = false;
+    
+    // Priority 1: Key-position mode (zero-latency, recommended)
+    if (cfg->snipe_mode_key_position >= 0) {
+        in_snipe_mode = ps2_snipe_mode_key_pressed;
+        LOG_DBG("Snipe mode check: using key-position, active=%d", in_snipe_mode);
+    } 
+    // Priority 2: Layer mode (legacy, fallback)
+    else if (cfg->snipe_layer >= 0) {
+        in_snipe_mode = (zmk_keymap_highest_layer_active() == cfg->snipe_layer);
+        LOG_DBG("Snipe mode check: using layer %d, active=%d", cfg->snipe_layer, in_snipe_mode);
+    }
+    
+    // Check scroll mode to give it precedence
+    bool scroll_takes_precedence = false;
+    if (cfg->scroll_mode_key_position >= 0) {
+        scroll_takes_precedence = ps2_scroll_mode_key_pressed;
+    } else if (cfg->scroll_layer >= 0) {
+        scroll_takes_precedence = (zmk_keymap_highest_layer_active() == cfg->scroll_layer);
+    }
+    
+    // Apply snipe divisor (only if not in scroll mode)
+    if (in_snipe_mode && !scroll_takes_precedence) {
         int div = cfg->snipe_divisor > 0 ? cfg->snipe_divisor : 2;
         evt->value = (int16_t)(evt->value / div);
+        LOG_DBG("Applied snipe divisor: %d, result=%d", div, evt->value);
     }
 
-    if (cfg->scroll_layer >=0 && zmk_keymap_highest_layer_active() == cfg->scroll_layer) {
+    /* ============================================================================
+     * ⭐⭐⭐ Scroll Mode: Convert mouse movement to scroll wheel
+     * ============================================================================
+     * Priority Logic:
+     * 1. If scroll-mode-key-position is configured (>= 0): use global variable (RECOMMENDED)
+     * 2. Else: fall back to scroll-layer check (legacy mode)
+     */
+    bool in_scroll_mode = false;
+    
+    // Priority 1: Key-position mode (zero-latency, recommended)
+    if (cfg->scroll_mode_key_position >= 0) {
+        in_scroll_mode = ps2_scroll_mode_key_pressed;
+        LOG_DBG("Scroll mode check: using key-position, active=%d", in_scroll_mode);
+    }
+    // Priority 2: Layer mode (legacy, fallback)
+    else if (cfg->scroll_layer >= 0) {
+        in_scroll_mode = (zmk_keymap_highest_layer_active() == cfg->scroll_layer);
+        LOG_DBG("Scroll mode check: using layer %d, active=%d", cfg->scroll_layer, in_scroll_mode);
+    }
+    
+    if (in_scroll_mode) {
         int16_t original_val = evt->value;
 
         /* Convert mouse axis to scroll axis */
@@ -272,8 +449,6 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
     LOG_DBG("Got input_handler_ps2 event: %s with value 0x%x", get_input_code_name(evt),
             evt->value);
 
-    zmk_input_listener_ps2_layer_toggle_input_rel_received(config, data);
-
     switch (evt->type) {
     case INPUT_EV_REL:
         handle_rel_code(data, evt);
@@ -287,19 +462,63 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
     }
 
     if (evt->sync) {
-        if (config->scroll_layer >= 0 && zmk_keymap_highest_layer_active() == config->scroll_layer) {
+        /* ============================================================================
+         * ⭐⭐⭐ Auto-Mouse Layer: Trigger on movement (PMW3610-style)
+         * ============================================================================
+         * Check for mouse movement and activate auto-mouse layer if threshold is met.
+         * This happens BEFORE scroll mode processing.
+         */
+#if AUTOMOUSE_LAYER >= 0
+        if (data->mouse.data.mode == INPUT_LISTENER_XY_DATA_MODE_REL) {
+            int movement = abs(data->mouse.data.x) + abs(data->mouse.data.y);
+            if (movement > AUTOMOUSE_THRESHOLD) {
+                ps2_activate_automouse_layer();
+            }
+        }
+#endif
+
+        /* ⭐⭐⭐ Check scroll mode with priority logic */
+        bool in_scroll_mode_sync = false;
+        if (config->scroll_mode_key_position >= 0) {
+            in_scroll_mode_sync = ps2_scroll_mode_key_pressed;
+        } else if (config->scroll_layer >= 0) {
+            in_scroll_mode_sync = (zmk_keymap_highest_layer_active() == config->scroll_layer);
+        }
+        
+        if (in_scroll_mode_sync) {
             int16_t sx = data->mouse.wheel_data.x;
             int16_t sy = data->mouse.wheel_data.y;
 
-            /* --- Clear residues when entering scroll layer for smooth start --- */
-            int current_layer = zmk_keymap_highest_layer_active();
-            if (data->prev_scroll_layer != current_layer) {
-                if (current_layer == config->scroll_layer) {
-                    LOG_DBG("Entering scroll layer, clearing residues");
-                    data->scroll_residue_x = 0;
-                    data->scroll_residue_y = 0;
+            /* --- Clear residues when entering scroll mode for smooth start --- */
+            // For key-position mode: detect state change via global variable
+            // For layer mode: detect via prev_scroll_layer tracking
+            bool just_entered_scroll_mode = false;
+            
+            if (config->scroll_mode_key_position >= 0) {
+                // Key-position mode: simple edge detection
+                // (Note: we could add a static bool to track previous state, but
+                // residue watchdog already handles most cases. Keep it simple.)
+                static bool prev_scroll_key_state = false;
+                if (ps2_scroll_mode_key_pressed && !prev_scroll_key_state) {
+                    just_entered_scroll_mode = true;
+                    LOG_DBG("Entering scroll mode (key-position), clearing residues");
                 }
-                data->prev_scroll_layer = current_layer;
+                prev_scroll_key_state = ps2_scroll_mode_key_pressed;
+            } else if (config->scroll_layer >= 0) {
+                // Layer mode: use existing prev_scroll_layer tracking
+                int current_layer = zmk_keymap_highest_layer_active();
+                if (data->prev_scroll_layer != current_layer) {
+                    if (current_layer == config->scroll_layer) {
+                        just_entered_scroll_mode = true;
+                        LOG_DBG("Entering scroll layer, clearing residues");
+                    }
+                    data->prev_scroll_layer = current_layer;
+                }
+            }
+            
+            if (just_entered_scroll_mode) {
+                data->scroll_residue_x = 0;
+                data->scroll_residue_y = 0;
             }
 
             /* --- Watchdog: clear residues if idle too long --- */
@@ -559,81 +778,6 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
     }
 }
 
-void zmk_input_listener_ps2_layer_toggle_input_rel_received(
-    const struct input_listener_ps2_config *config, struct input_listener_ps2_data *data) {
-    if (config->layer_toggle == -1) {
-        return;
-    }
-
-    data->layer_toggle_last_mouse_package_time = k_uptime_get();
-
-    if (data->layer_toggle_layer_enabled == false) {
-        k_work_schedule(&data->layer_toggle_activation_delay,
-                        K_MSEC(config->layer_toggle_delay_ms));
-    } else {
-        // Deactivate the layer if no further movement within
-        // layer_toggle_timeout_ms
-        k_work_reschedule(&data->layer_toggle_deactivation_delay,
-                          K_MSEC(config->layer_toggle_timeout_ms));
-    }
-}
-
-void zmk_input_listener_ps2_layer_toggle_activate_layer(struct k_work *item) {
-    struct k_work_delayable *d_work = k_work_delayable_from_work(item);
-
-    struct input_listener_ps2_data *data =
-        CONTAINER_OF(d_work, struct input_listener_ps2_data, layer_toggle_activation_delay);
-    const struct input_listener_ps2_config *config = data->dev->config;
-
-    int64_t current_time = k_uptime_get();
-    int64_t last_mv_within_ms = current_time - data->layer_toggle_last_mouse_package_time;
-
-    if (last_mv_within_ms <= config->layer_toggle_timeout_ms * 0.1) {
-        LOG_INF("Activating layer %d due to mouse activity...", config->layer_toggle);
-
-#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_ENABLE_UROB_COMPAT)
-
-        zmk_keymap_layer_activate(config->layer_toggle, false);
-
-#else
-
-        zmk_keymap_layer_activate(config->layer_toggle);
-
-#endif /* IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_ENABLE_UROB_COMPAT) */
-
-        data->layer_toggle_layer_enabled = true;
-    } else {
-        LOG_INF("Not activating mouse layer %d, because last mouse activity was %lldms ago",
-                config->layer_toggle, last_mv_within_ms);
-    }
-}
-
-void zmk_input_listener_ps2_layer_toggle_deactivate_layer(struct k_work *item) {
-    struct k_work_delayable *d_work = k_work_delayable_from_work(item);
-
-    struct input_listener_ps2_data *data =
-        CONTAINER_OF(d_work, struct input_listener_ps2_data, layer_toggle_deactivation_delay);
-    const struct input_listener_ps2_config *config = data->dev->config;
-
-    LOG_INF("Deactivating layer %d due to mouse activity...", config->layer_toggle);
-
-    if (zmk_keymap_layer_active(config->layer_toggle)) {
-        zmk_keymap_layer_deactivate(config->layer_toggle);
-    }
-
-    data->layer_toggle_layer_enabled = false;
-}
-
-static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_ps2_config *config,
-                                                    struct input_listener_ps2_data *data) {
-    k_work_init_delayable(&data->layer_toggle_activation_delay,
-                          zmk_input_listener_ps2_layer_toggle_activate_layer);
-    k_work_init_delayable(&data->layer_toggle_deactivation_delay,
-                          zmk_input_listener_ps2_layer_toggle_deactivate_layer);
-
-    return 0;
-}
-
 #endif // VALID_LISTENER_COUNT > 0
 
 #define IL_INST(n)                                                                                 \
@@ -646,9 +790,10 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                             .y_invert = DT_INST_PROP(n, y_invert),                                 \
                             .scale_multiplier = DT_INST_PROP(n, scale_multiplier),                 \
                             .scale_divisor = DT_INST_PROP(n, scale_divisor),                       \
-                            .layer_toggle = DT_INST_PROP(n, layer_toggle),                         \
-                            .layer_toggle_delay_ms = DT_INST_PROP(n, layer_toggle_delay_ms),       \
-                            .layer_toggle_timeout_ms = DT_INST_PROP(n, layer_toggle_timeout_ms),   \
+                            /* Key-position based mode control */                                  \
+                            .scroll_mode_key_position = DT_INST_PROP(n, scroll_mode_key_position), \
+                            .snipe_mode_key_position = DT_INST_PROP(n, snipe_mode_key_position),   \
+                            /* Layer-based mode control */                                         \
                             .scroll_layer = DT_INST_PROP(n, scroll_layer),                         \
                             .scroll_speed_num = DT_INST_PROP(n, scroll_speed_num),                 \
                             .scroll_speed_den = DT_INST_PROP(n, scroll_speed_den),                 \
@@ -663,8 +808,6 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                     static struct input_listener_ps2_data data_##n =                               \
                         {                                                                          \
                             .dev = DEVICE_DT_INST_GET(n),                                          \
-                            .layer_toggle_layer_enabled = false,                                   \
-                            .layer_toggle_last_mouse_package_time = 0,                             \
                             .scroll_residue_x = 0,                                                 \
                             .scroll_residue_y = 0,                                                 \
                             .scroll_last_activity_ms = 0,                                          \
@@ -681,7 +824,29 @@ static int zmk_input_listener_ps2_layer_toggle_init(const struct input_listener_
                         struct input_listener_ps2_data *data = dev->data;                          \
                         const struct input_listener_ps2_config *config = dev->config;              \
                                                                                                    \
-                        zmk_input_listener_ps2_layer_toggle_init(config, data);                    \
+                        /* Save config to global variable for event listener access */             \
+                        ps2_global_config = config;                                                \
+                                                                                                   \
+                        /* Log configuration mode */                                               \
+                        if (config->scroll_mode_key_position >= 0) {                               \
+                            LOG_INF("PS/2: Using scroll-mode-key-position = %d (zero-latency)",    \
+                                    config->scroll_mode_key_position);                             \
+                        } else if (config->scroll_layer >= 0) {                                    \
+                            LOG_INF("PS/2: Using scroll-layer = %d (legacy mode)",                 \
+                                    config->scroll_layer);                                         \
+                        }                                                                          \
+                        if (config->snipe_mode_key_position >= 0) {                                \
+                            LOG_INF("PS/2: Using snipe-mode-key-position = %d (zero-latency)",     \
+                                    config->snipe_mode_key_position);                              \
+                        } else if (config->snipe_layer >= 0) {                                     \
+                            LOG_INF("PS/2: Using snipe-layer = %d (legacy mode)",                  \
+                                    config->snipe_layer);                                          \
+                        }                                                                          \
+                                                                                                   \
+                        LOG_INF("PS/2: Auto-mouse layer configuration:");                          \
+                        LOG_INF("  - Layer: %d (-1 = disabled)", AUTOMOUSE_LAYER);                 \
+                        LOG_INF("  - Timeout: %dms", AUTOMOUSE_TIMEOUT_MS);                        \
+                        LOG_INF("  - Threshold: %d", AUTOMOUSE_THRESHOLD);                         \
                                                                                                    \
                         return 0;                                                                  \
                     }                                                                              \

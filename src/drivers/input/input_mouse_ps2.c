@@ -154,6 +154,26 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #define MOUSE_PS2_SETTINGS_SUBTREE "mouse_ps2"
 
+/* ============================================================================
+ * ⭐⭐⭐ Async Adjustment Execution (Fix Sticky Key Issue)
+ * ============================================================================
+ * To prevent blocking the ZMK event system (10-20ms), sensitivity adjustments
+ * are executed asynchronously in a system work queue.
+ * 
+ * Problem: PS/2 commands block for 10-20ms, causing:
+ *   1. Auto-mouse layer timer to expire prematurely
+ *   2. Key release events to be misinterpreted on wrong layer
+ *   3. TrackPoint reporting pause to starve the auto-mouse timer
+ * 
+ * Solution: Submit adjustment requests to work queue, return immediately (<1ms).
+ */
+
+static int pending_sensitivity_change = 0;
+static K_MUTEX_DEFINE(sensitivity_adjustment_mutex);
+
+static void zmk_mouse_ps2_sensitivity_adjustment_work_handler(struct k_work *work);
+static K_WORK_DEFINE(sensitivity_adjustment_work, zmk_mouse_ps2_sensitivity_adjustment_work_handler);
+
 typedef enum {
     MOUSE_PS2_PACKET_MODE_PS2_DEFAULT,
     MOUSE_PS2_PACKET_MODE_SCROLL,
@@ -1294,19 +1314,50 @@ int zmk_mouse_ps2_tp_sensitivity_set(int sensitivity) {
     return 0;
 }
 
-int zmk_mouse_ps2_tp_sensitivity_change(int amount) {
+/* ============================================================================
+ * Async Sensitivity Adjustment Work Handler
+ * ============================================================================
+ * Executes in system work queue, blocking is allowed here.
+ */
+static void zmk_mouse_ps2_sensitivity_adjustment_work_handler(struct k_work *work) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
-
+    int amount;
+    
+    // Read and clear pending adjustment atomically
+    k_mutex_lock(&sensitivity_adjustment_mutex, K_FOREVER);
+    amount = pending_sensitivity_change;
+    pending_sensitivity_change = 0;
+    k_mutex_unlock(&sensitivity_adjustment_mutex);
+    
+    if (amount == 0) {
+        return;  // Nothing to do
+    }
+    
     int new_val = data->tp_sensitivity + amount;
-
-    LOG_INF("Setting trackpoint sensitivity to %d", new_val);
+    
+    LOG_INF("Async: Setting trackpoint sensitivity to %d (delta: %+d)", new_val, amount);
     int err = zmk_mouse_ps2_tp_sensitivity_set(new_val);
     if (err == 0) {
-
         zmk_mouse_ps2_settings_save();
+    } else {
+        LOG_ERR("Async: Failed to set sensitivity: %d", err);
     }
+}
 
-    return err;
+int zmk_mouse_ps2_tp_sensitivity_change(int amount) {
+    k_mutex_lock(&sensitivity_adjustment_mutex, K_FOREVER);
+    
+    // Accumulate adjustment (supports rapid key presses)
+    pending_sensitivity_change += amount;
+    
+    k_mutex_unlock(&sensitivity_adjustment_mutex);
+    
+    // Submit to system work queue (returns immediately)
+    k_work_submit(&sensitivity_adjustment_work);
+    
+    LOG_DBG("Submitted sensitivity adjustment: %+d (async, total pending: %+d)", 
+            amount, pending_sensitivity_change);
+    return 0;
 }
 
 int zmk_mouse_ps2_tp_negative_inertia_get(uint8_t *neg_inertia) {

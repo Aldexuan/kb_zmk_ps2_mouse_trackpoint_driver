@@ -73,21 +73,42 @@ static const struct input_listener_ps2_config *ps2_global_config = NULL;
 /* Global state */
 static bool ps2_automouse_triggered = false;
 
-/* Forward declaration of timer callback */
-static void ps2_deactivate_automouse_layer(struct k_timer *timer);
+/* ⭐ 方案一：用可延迟工作项 (k_work_delayable) 替代 K_TIMER。
+ *
+ * 原来的 K_TIMER 到期回调运行在【系统定时器中断 (ISR) 上下文】，却调用了
+ * zmk_keymap_layer_deactivate() —— 该函数会修改层状态位图并 raise 一个
+ * layer_state_changed 事件（事件对象来自内存池、会向工作队列投递），这类操作
+ * 不是 ISR 安全的，是导致“需要关机重开”的层/事件流水线错乱的根因。
+ *
+ * 改用 k_work_delayable 后，超时回调运行在【系统工作队列线程上下文】，在其中
+ * 调用 keymap / 事件 API 是安全的。 */
+static struct k_work_delayable ps2_automouse_work;
 
-/* Define kernel timer (this creates the timer object automatically) */
-K_TIMER_DEFINE(ps2_automouse_timer, ps2_deactivate_automouse_layer, NULL);
+/* ⭐ 方案二：用互斥锁串行化“激活”与“关闭超时”两段临界区。
+ *
+ * 方案一实施后，激活运行在 PS/2 回调工作队列线程、关闭运行在系统工作队列线程，
+ * 仍是两个线程并发对 ps2_automouse_triggered 和层状态位图做读-改-写。此锁保证
+ * 这两段不会交错执行（一段跑到一半被另一段抢占），消除该数据竞争。
+ *
+ * 注意：临界区很短、内部不再嵌套任何其它锁，无死锁/优先级反转的实际风险；且两段
+ * 都在线程上下文（非 ISR），k_mutex 使用合法。 */
+static K_MUTEX_DEFINE(ps2_automouse_lock);
 
-/* Timer callback: deactivate layer after timeout */
-static void ps2_deactivate_automouse_layer(struct k_timer *timer) {
+/* Work handler: deactivate layer after timeout (now runs in THREAD context) */
+static void ps2_deactivate_automouse_layer(struct k_work *work) {
+    k_mutex_lock(&ps2_automouse_lock, K_FOREVER);
+
     ps2_automouse_triggered = false;
     zmk_keymap_layer_deactivate(AUTOMOUSE_LAYER);
     LOG_INF("PS/2: Auto-mouse layer %d deactivated (timeout)", AUTOMOUSE_LAYER);
+
+    k_mutex_unlock(&ps2_automouse_lock);
 }
 
-/* Activate layer and start/restart timer */
+/* Activate layer and start/restart the timeout work */
 static void ps2_activate_automouse_layer(void) {
+    k_mutex_lock(&ps2_automouse_lock, K_FOREVER);
+
     if (!ps2_automouse_triggered) {
         LOG_INF("PS/2: Auto-mouse layer %d activated", AUTOMOUSE_LAYER);
     }
@@ -95,9 +116,22 @@ static void ps2_activate_automouse_layer(void) {
     ps2_automouse_triggered = true;
     zmk_keymap_layer_activate(AUTOMOUSE_LAYER);
     
-    /* Start/restart timer (automatically cancels previous timer) */
-    k_timer_start(&ps2_automouse_timer, K_MSEC(AUTOMOUSE_TIMEOUT_MS), K_NO_WAIT);
+    /* Start/restart timeout (k_work_reschedule automatically cancels the
+     * previous pending timeout). Safe to call from thread context. */
+    k_work_reschedule(&ps2_automouse_work, K_MSEC(AUTOMOUSE_TIMEOUT_MS));
+
+    k_mutex_unlock(&ps2_automouse_lock);
 }
+
+/* Initialize the delayable work item (called once from listener init) */
+static inline void ps2_automouse_init(void) {
+    k_work_init_delayable(&ps2_automouse_work, ps2_deactivate_automouse_layer);
+}
+
+#else // AUTOMOUSE_LAYER >= 0
+
+/* No-op when auto-mouse layer is disabled, so init can call it unconditionally */
+static inline void ps2_automouse_init(void) {}
 
 #endif // AUTOMOUSE_LAYER >= 0
 
@@ -852,6 +886,9 @@ static void input_handler_ps2(const struct input_listener_ps2_config *config,
                         LOG_INF("  - Layer: %d (-1 = disabled)", AUTOMOUSE_LAYER);                 \
                         LOG_INF("  - Timeout: %dms", AUTOMOUSE_TIMEOUT_MS);                        \
                         LOG_INF("  - Threshold: %d", AUTOMOUSE_THRESHOLD);                         \
+                                                                                                   \
+                        /* ⭐ 方案一：初始化自动层超时的可延迟工作项 */                            \
+                        ps2_automouse_init();                                                      \
                                                                                                    \
                         return 0;                                                                  \
                     }                                                                              \

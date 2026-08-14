@@ -2315,10 +2315,25 @@ int zmk_mouse_ps2_power_up(void) {
      *    there's any residual vibration or finger contact. */
     k_sleep(K_MSEC(100));
 
-    /* 6. Release any mouse buttons that may be stuck in the pressed
+    /* 6. Hard-reset the parser state and set a generous discard window.
+     *    ⚠️ CRITICAL: This MUST be done BEFORE releasing any mouse buttons
+     *    (step 7), because input_report_key() may trigger internal processing
+     *    that reads wake_up_packets_to_discard or packet_buffer. If those
+     *    are not initialized yet, early drift packets won't be discarded and
+     *    will cause persistent cursor drift after wake.
+     *    The first ~30 packets after POR often carry residual drift as
+     *    the TP's internal filter converges. Discarding them prevents
+     *    any visible cursor jump. */
+    data->packet_idx = 0;
+    memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
+    data->wake_up_packets_to_discard = 50;
+
+    /* 7. Release any mouse buttons that may be stuck in the pressed
      *    state. This prevents drift caused by the parser thinking a
      *    button is still held (e.g., from garbage bytes before sleep
-     *    or interrupted packet sequences). */
+     *    or interrupted packet sequences).
+     *    ⚠️ This is done AFTER parser reset (step 6) to ensure
+     *    wake_up_packets_to_discard is already set. */
     if (data->button_l_is_held) {
         input_report_key(data->dev, INPUT_BTN_0, 0, true, K_FOREVER);
         data->button_l_is_held = false;
@@ -2331,14 +2346,6 @@ int zmk_mouse_ps2_power_up(void) {
         input_report_key(data->dev, INPUT_BTN_2, 0, true, K_FOREVER);
         data->button_m_is_held = false;
     }
-
-    /* 7. Hard-reset the parser state and set a generous discard window.
-     *    The first ~30 packets after POR often carry residual drift as
-     *    the TP's internal filter converges. Discarding them prevents
-     *    any visible cursor jump. */
-    data->packet_idx = 0;
-    memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
-    data->wake_up_packets_to_discard = 50;
 
     /* 8. Reapply user configuration that lives in TP RAM. */
     zmk_mouse_ps2_apply_tp_settings_impl(true);

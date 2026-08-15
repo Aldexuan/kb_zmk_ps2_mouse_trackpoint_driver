@@ -22,6 +22,72 @@ config ZMK_INPUT_MOUSE_PS2_POWER_ON_RESET_TIME
     help
       Refer to IBM TrackPoint System Version 4.0 Engineering Specification - Section 2.1
 
+config ZMK_INPUT_MOUSE_PS2_INTER_PACKET_GAP_MS
+    int "Gap (ms) between activity bytes that marks the start of a new packet"
+    default 4
+    help
+      A PS/2 mouse packet is three bytes with no framing, so alignment is
+      positional only. Bytes inside one packet arrive roughly 1ms apart, while
+      consecutive packets are separated by the sample interval (~10ms at
+      100Hz). When the driver is mid-packet and a gap at least this long
+      elapses, the new byte is treated as the start of a fresh packet, which
+      recovers alignment after a desync.
+
+      The timestamp is taken in the driver callback rather than the UART ISR,
+      so the measured gap includes work-queue scheduling latency. The default
+      of 4ms sits between the two real spacings with margin for that latency.
+      Raise it if the log shows re-anchoring during normal movement; lower it
+      for faster recovery on a lightly loaded system.
+
+config ZMK_INPUT_MOUSE_PS2_POST_POR_SETTLE_MS
+    int "Quiet time (ms) after power-on reset before reporting is enabled"
+    default 100
+    help
+      Time spent waiting after the TrackPoint's power-on reset completes and
+      before data reporting is switched back on.
+
+      Reporting is off during this window, so the TrackPoint's internal drift
+      correction converges without any of it reaching the host. Extending this
+      is therefore the only way to genuinely remove post-wake drift rather than
+      filter it out afterwards.
+
+      The cost is wake latency: this delay is added directly to the time
+      between the keypress that wakes the board and the pointer becoming
+      usable, on top of the ~600ms POR. The default is kept short because
+      WAKE_DEADZONE_MS handles drift without that cost. Raise it (e.g. to
+      1000-1500) if you would rather trade wake responsiveness for a pointer
+      that is completely clean the instant it comes up.
+
+config ZMK_INPUT_MOUSE_PS2_WAKE_DEADZONE_MS
+    int "Duration (ms) of the post-wake drift suppression window"
+    default 1500
+    help
+      A TrackPoint re-establishes its strain-gauge zero baseline on every
+      power-on reset. If the stick is under any load at that moment the
+      baseline latches slightly off, and the device emits small non-zero
+      deltas until its internal drift correction re-converges - typically one
+      to two seconds of the cursor sliding on its own after wake.
+
+      For this long, movements at or below WAKE_DEADZONE_THRESHOLD are treated
+      as drift and dropped. The threshold ramps down to zero across the window
+      so sensitivity returns gradually. Buttons are never gated, and a movement
+      above the threshold closes the window immediately, so a deliberate push
+      is never held back.
+
+      Set to 0 to disable drift suppression entirely.
+
+config ZMK_INPUT_MOUSE_PS2_WAKE_DEADZONE_THRESHOLD
+    int "Movement magnitude treated as drift during the post-wake window"
+    default 2
+    help
+      Movements with |x| and |y| both at or below this are suppressed while the
+      window from WAKE_DEADZONE_MS is open. Recalibration drift is normally a
+      couple of counts per packet while a deliberate push is much larger, which
+      is what makes the two separable by amplitude.
+
+      Raise it if drift still gets through after wake; lower it if slow
+      deliberate movement feels suppressed in the first second or so.
+
 config ZMK_INPUT_MOUSE_PS2_ENABLE_UROB_COMPAT
     bool "Makes the driver compatible with urob's zmk fork. His fork has commits that change the default zmk function definitions. This option adopts the code to make it compatible with his changes. Only enable it if you are using his fork or it will fail to compile."
 	default n
@@ -80,9 +146,12 @@ config ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING
 
 config ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING_WAKE_DELAY_MS
     int "Milliseconds to wait after VCC is restored before starting PS/2 handshake"
-    depends on ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING
     default 200
     help
+      Used both when waking from idle and at driver init, since both assert VCC
+      before talking to the device. It is therefore not gated on
+      ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING.
+
       Extra settle time after driving VCC high, before re-running Power-On-Reset.
       The POR sequence itself already waits 600ms with RST asserted, so this only
       covers LDO/cap charge time and — more importantly — gives the TP a fully

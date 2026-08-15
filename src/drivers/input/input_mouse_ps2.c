@@ -43,6 +43,15 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 // drop the packet and resync instead of forwarding a cursor jump to the host.
 #define MOUSE_PS2_MOVEMENT_SANITY_LIMIT 60
 
+// Bytes within one PS/2 packet arrive back-to-back (~1ms apart at the PS/2
+// clock rate), whereas consecutive packets are separated by the sample
+// interval (~10ms at 100Hz). A gap larger than this therefore means the byte
+// we just received starts a new packet rather than continuing the current one,
+// which is the only reliable way to recover byte-level alignment: the 3-byte
+// packet format has no framing, so a stream that is off by one byte stays off
+// by one byte until a boundary is identified this way.
+#define MOUSE_PS2_INTER_PACKET_GAP_MS CONFIG_ZMK_INPUT_MOUSE_PS2_INTER_PACKET_GAP_MS
+
 /*
  * PS/2 Defines
  */
@@ -296,6 +305,16 @@ struct zmk_mouse_ps2_data {
 
     // Power saving: Track wake-up packets to discard initial drift
     uint8_t wake_up_packets_to_discard;
+
+    // Uptime (ms) at which the previous activity byte was handled. Used to
+    // detect the inter-packet gap and recover byte-level alignment.
+    uint32_t last_byte_time;
+
+    // Post-wake drift suppression window. While uptime is before this, small
+    // movements are treated as TrackPoint recalibration drift and dropped.
+    // Zero means "not in a wake window".
+    uint32_t wake_deadzone_until;
+    uint32_t wake_deadzone_start;
 };
 
 static const struct zmk_mouse_ps2_config zmk_mouse_ps2_config = {
@@ -408,6 +427,10 @@ void zmk_mouse_ps2_activity_scroll(int8_t scroll_y);
 void zmk_mouse_ps2_activity_click_buttons(bool button_l, bool button_m, bool button_r);
 void zmk_mouse_ps2_activity_reset_packet_buffer();
 void zmk_mouse_ps2_request_wake_up_discard(uint8_t packets);
+void zmk_mouse_ps2_release_all_buttons(void);
+void zmk_mouse_ps2_activity_reset_prev_packet();
+void zmk_mouse_ps2_start_wake_deadzone(void);
+static void zmk_mouse_ps2_vcc_set(bool powered);
 struct zmk_mouse_ps2_packet
 zmk_mouse_ps2_activity_parse_packet_buffer(zmk_mouse_ps2_packet_mode packet_mode,
                                            uint8_t packet_state, uint8_t packet_x, uint8_t packet_y,
@@ -422,6 +445,32 @@ void zmk_mouse_ps2_activity_callback(const struct device *ps2_device, uint8_t by
     k_work_cancel_delayable(&data->packet_buffer_timeout);
 
     // LOG_DBG("Received mouse movement data: 0x%x", byte);
+
+    /* Byte-level resynchronisation.
+     *
+     * If we are mid-packet but a long gap has elapsed since the previous byte,
+     * the bytes we already buffered belong to an earlier packet that never
+     * completed, and this byte is the start of a fresh one. Re-anchoring here
+     * is what actually fixes a one-byte misalignment: discarding whole packets
+     * cannot, because it removes bytes in groups of three at the wrong offset
+     * and preserves the misalignment exactly.
+     *
+     * We only re-anchor when this byte also passes the bit-3 test below, i.e.
+     * when it is plausible as a first byte. Without that guard a merely slow
+     * work queue could drop a perfectly good partial packet and create the very
+     * misalignment we are trying to remove. The timestamp is taken here rather
+     * than in the UART ISR, so the measured gap includes work-queue latency;
+     * that is why the threshold is tunable and defaults well above the ~1ms
+     * intra-packet spacing.
+     */
+    uint32_t now = k_uptime_get_32();
+    if (data->packet_idx != 0 && (now - data->last_byte_time) >= MOUSE_PS2_INTER_PACKET_GAP_MS &&
+        MOUSE_PS2_GET_BIT(byte, 3) == 1) {
+        LOG_DBG("Inter-packet gap of %ums at idx=%d; re-anchoring packet start",
+                now - data->last_byte_time, data->packet_idx);
+        zmk_mouse_ps2_activity_reset_packet_buffer();
+    }
+    data->last_byte_time = now;
 
     data->packet_buffer[data->packet_idx] = byte;
 
@@ -492,6 +541,11 @@ void zmk_mouse_ps2_activity_packet_timout(struct k_work *item) {
     // This way if the mouse ever gets out of alignment, the user
     // can reset it by just not moving it for a second.
     zmk_mouse_ps2_activity_reset_packet_buffer();
+
+    // The stream has stopped, so the delta baseline is stale. Drop it too, or
+    // the first packet after the pause gets measured against an arbitrarily old
+    // one and can be discarded as a bogus jump.
+    zmk_mouse_ps2_activity_reset_prev_packet();
 }
 
 void zmk_mouse_ps2_activity_reset_packet_buffer() {
@@ -499,6 +553,22 @@ void zmk_mouse_ps2_activity_reset_packet_buffer() {
 
     data->packet_idx = 0;
     memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
+}
+
+/*
+ * Drop the delta baseline used by the movement-jump heuristic.
+ *
+ * prev_packet only means anything for packets that are adjacent in time. After
+ * an inter-packet timeout the next packet may be minutes newer, so comparing
+ * against the stale one is meaningless — and actively harmful, because the
+ * x_delta/y_delta check would reject the user's first real movement after a
+ * pause as a "malformed packet". Zeroing it makes the first packet after a gap
+ * compare against a neutral baseline instead.
+ */
+void zmk_mouse_ps2_activity_reset_prev_packet() {
+    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+
+    memset(&data->prev_packet, 0x0, sizeof(data->prev_packet));
 }
 
 /*
@@ -518,6 +588,71 @@ void zmk_mouse_ps2_request_wake_up_discard(uint8_t packets) {
     if (packets > data->wake_up_packets_to_discard) {
         data->wake_up_packets_to_discard = packets;
     }
+}
+
+/*
+ * Open the post-wake drift-suppression window.
+ *
+ * A TrackPoint re-establishes its strain-gauge zero baseline every time it goes
+ * through power-on reset. If anything is loading the stick while that happens
+ * the baseline latches slightly off, and the device then emits a steady stream
+ * of small non-zero deltas until its internal drift correction re-converges —
+ * roughly one to two seconds of the cursor sliding on its own.
+ *
+ * Discarding whole packets cannot fix this well: the drift lasts far longer
+ * than a sensible discard window, and a window wide enough to cover it also
+ * swallows the first movement the user actually intends. A magnitude deadzone
+ * separates the two instead, because drift and intent differ in amplitude
+ * (drift is a couple of counts, a deliberate push is much larger).
+ *
+ * The threshold decays linearly to zero across the window rather than being
+ * switched off at the end, so sensitivity is restored gradually instead of
+ * changing abruptly under the user's finger.
+ */
+void zmk_mouse_ps2_start_wake_deadzone(void) {
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_WAKE_DEADZONE_MS > 0
+    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+
+    data->wake_deadzone_start = k_uptime_get_32();
+    data->wake_deadzone_until =
+        data->wake_deadzone_start + CONFIG_ZMK_INPUT_MOUSE_PS2_WAKE_DEADZONE_MS;
+
+    LOG_DBG("Wake drift deadzone active for %dms (threshold %d)",
+            CONFIG_ZMK_INPUT_MOUSE_PS2_WAKE_DEADZONE_MS,
+            CONFIG_ZMK_INPUT_MOUSE_PS2_WAKE_DEADZONE_THRESHOLD);
+#endif
+}
+
+/*
+ * Current deadzone threshold, or 0 when the window is closed / disabled.
+ * Ramps from the configured value down to 0 over the window.
+ */
+static int zmk_mouse_ps2_wake_deadzone_threshold(void) {
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_WAKE_DEADZONE_MS > 0
+    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+
+    if (data->wake_deadzone_until == 0) {
+        return 0;
+    }
+
+    uint32_t now = k_uptime_get_32();
+
+    /* Signed comparison so this still terminates correctly if uptime wraps. */
+    if ((int32_t)(now - data->wake_deadzone_until) >= 0) {
+        data->wake_deadzone_until = 0;
+        LOG_DBG("Wake drift deadzone expired");
+        return 0;
+    }
+
+    uint32_t elapsed = now - data->wake_deadzone_start;
+    uint32_t total = data->wake_deadzone_until - data->wake_deadzone_start;
+    int full = CONFIG_ZMK_INPUT_MOUSE_PS2_WAKE_DEADZONE_THRESHOLD;
+
+    /* Linear ramp: full at the start of the window, 0 at its end. */
+    return (int)((full * (total - elapsed)) / total);
+#else
+    return 0;
+#endif
 }
 
 void zmk_mouse_ps2_activity_process_cmd(zmk_mouse_ps2_packet_mode packet_mode, uint8_t packet_state,
@@ -545,15 +680,37 @@ void zmk_mouse_ps2_activity_process_cmd(zmk_mouse_ps2_packet_mode packet_mode, u
             packet.mov_x, packet.mov_y, packet.overflow_x, packet.overflow_y, packet.scroll,
             packet.button_l, packet.button_m, packet.button_r, x_delta, y_delta);
 
-#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_ENABLE_ERROR_MITIGATION)
+    /* Overflow on both axes at once is not something a TrackPoint reports in
+     * normal operation; it is the fingerprint of a protocol byte that leaked
+     * into the packet stream and got decoded as a state byte.
+     *
+     * The concrete case: ps2_uart's write path waits up to 300ms for a command
+     * ACK (PS2_UART_TIMEOUT_WRITE_AWAIT_RESPONSE) and then clears
+     * write_awaits_resp regardless of whether the ACK arrived. An ACK that
+     * shows up after that deadline is no longer recognised as a write response,
+     * so it is delivered to us as ordinary data. 0xFA decodes as
+     * button_r=1, both sign bits set and both overflow bits set — a stuck right
+     * button plus a large negative jump on both axes — and its bit 3 is 1, so
+     * the alignment check waves it through. It also shifts every following
+     * packet by one byte.
+     *
+     * This check is deliberately outside ENABLE_ERROR_MITIGATION (which
+     * defaults to n): the stray-ACK path above exists regardless of which PS/2
+     * transport is in use, so gating the only cheap detector for it behind an
+     * off-by-default option leaves the failure completely unguarded. */
     if (packet.overflow_x == 1 && packet.overflow_y == 1) {
         LOG_WRN("Detected overflow in both x and y. "
                 "Probably mistransmission. Aborting...");
+
+        /* Clear anything a previous misaligned packet may have latched, for the
+         * same reason as in the movement sanity check below. */
+        zmk_mouse_ps2_release_all_buttons();
 
         zmk_mouse_ps2_activity_abort_cmd("Overflow in both x and y");
         return;
     }
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_ENABLE_ERROR_MITIGATION)
     // If the mouse exceeds the allowed threshold of movement, it's probably
     // a mistransmission or misalignment.
     // But we only do this check if there was prior movement that wasn't
@@ -581,6 +738,18 @@ void zmk_mouse_ps2_activity_process_cmd(zmk_mouse_ps2_packet_mode packet_mode, u
         // Force reset the packet buffer to regain synchronization
         zmk_mouse_ps2_activity_reset_packet_buffer();
 
+        /* A packet this malformed means the byte stream is misaligned, and a
+         * misaligned state byte decodes random bits as button presses. If we
+         * simply returned here, a phantom press latched by an earlier packet
+         * would never see its release: every packet in the desync burst gets
+         * rejected at this very check, so click_buttons() is never reached and
+         * the host stays stuck in a drag for the whole burst.
+         *
+         * Movement from this packet is untrustworthy, but "release" is the
+         * safe direction regardless of alignment, so we always let it through.
+         * We never latch a *press* from an untrusted packet. */
+        zmk_mouse_ps2_release_all_buttons();
+
         // Ask the device to retransmit the last packet
         const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
         ps2_write(config->ps2_device, 0xFE); // RESEND command
@@ -589,6 +758,32 @@ void zmk_mouse_ps2_activity_process_cmd(zmk_mouse_ps2_packet_mode packet_mode, u
         // and using it as the delta baseline would make the next legitimate
         // packet look like a huge jump too.
         return;
+    }
+
+    /* Post-wake drift suppression. Only movement is gated: buttons stay fully
+     * live, because a click is unambiguous intent that must never be swallowed,
+     * and drift never produces one.
+     *
+     * The test requires *both* axes to be drift-sized before either is zeroed,
+     * rather than gating each axis on its own. Independent per-axis gating would
+     * turn a slow diagonal push of e.g. (2,3) into (0,3) and visibly skew the
+     * direction; treating the packet as a unit keeps the vector intact and only
+     * drops it when the whole movement is within drift amplitude. */
+    int deadzone = zmk_mouse_ps2_wake_deadzone_threshold();
+    if (deadzone > 0) {
+        if (abs(packet.mov_x) <= deadzone && abs(packet.mov_y) <= deadzone) {
+            LOG_DBG("Wake deadzone (%d) suppressed drift (x=%d, y=%d)", deadzone, packet.mov_x,
+                    packet.mov_y);
+            packet.mov_x = 0;
+            packet.mov_y = 0;
+        } else {
+            /* Real movement means the user has taken over; the baseline
+             * question is moot from here on, so close the window early rather
+             * than keep attenuating what they are doing. */
+            LOG_DBG("Wake deadzone released early by real movement (x=%d, y=%d)", packet.mov_x,
+                    packet.mov_y);
+            data->wake_deadzone_until = 0;
+        }
     }
 
     zmk_mouse_ps2_activity_move_mouse(packet.mov_x, packet.mov_y);
@@ -706,6 +901,39 @@ void zmk_mouse_ps2_activity_move_mouse(int16_t mov_x, int16_t mov_y) {
     }
     if (have_y) {
         ret = input_report_rel(data->dev, INPUT_REL_Y, mov_y, true, K_NO_WAIT);
+    }
+}
+
+/*
+ * Unconditionally release every button we currently believe is held.
+ *
+ * This deliberately bypasses zmk_mouse_ps2_activity_click_buttons(): that
+ * function treats "more than one button changed at once" as a transmission
+ * error and drops the whole update, which is exactly wrong when we are trying
+ * to clear multiple stuck buttons. Releasing is always the safe direction, so
+ * it is never filtered.
+ *
+ * Used on the wake / reset paths and whenever a packet is rejected as garbage,
+ * so a phantom press decoded from a misaligned byte stream cannot leave the
+ * host stuck in a drag.
+ */
+void zmk_mouse_ps2_release_all_buttons(void) {
+    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+
+    if (data->button_l_is_held) {
+        LOG_INF("Force-releasing button_l");
+        input_report_key(data->dev, INPUT_BTN_0, 0, true, K_FOREVER);
+        data->button_l_is_held = false;
+    }
+    if (data->button_r_is_held) {
+        LOG_INF("Force-releasing button_r");
+        input_report_key(data->dev, INPUT_BTN_1, 0, true, K_FOREVER);
+        data->button_r_is_held = false;
+    }
+    if (data->button_m_is_held) {
+        LOG_INF("Force-releasing button_m");
+        input_report_key(data->dev, INPUT_BTN_2, 0, true, K_FOREVER);
+        data->button_m_is_held = false;
     }
 }
 
@@ -1861,6 +2089,23 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
 
     const struct zmk_mouse_ps2_config *config = data->dev->config;
 
+    /* Assert VCC before doing anything else.
+     *
+     * Without this, startup depends on the vcc-gpios pin already happening to
+     * be in a state that powers the TrackPoint, and there are two ways it is
+     * not. On a true cold boot the pin is hi-Z, and on an nRF52 deep-sleep wake
+     * (System OFF, which resumes by resetting the SoC and re-running init) the
+     * pin was explicitly driven inactive by power_down() on the way into sleep.
+     * In both cases init_wait_for_mouse() below then talks to an unpowered
+     * device, burns all MOUSE_PS2_INIT_ATTEMPTS and gives up permanently — the
+     * pointer stays dead for the whole session while the keys and encoder,
+     * being unrelated subsystems, work fine. Asserting VCC here makes init
+     * self-sufficient instead of dependent on leftover pin state.
+     *
+     * No-op on boards without a vcc-gpios switch. */
+    zmk_mouse_ps2_vcc_set(true);
+    k_sleep(K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING_WAKE_DELAY_MS));
+
     zmk_mouse_ps2_init_power_on_reset();
 
     LOG_INF("Waiting for mouse to connect...");
@@ -2142,12 +2387,16 @@ void zmk_mouse_ps2_apply_tp_settings(void) {
     zmk_mouse_ps2_apply_tp_settings_impl(false);
 }
 
-#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING)
-
 /*
  * Drives a GPIO-connected power switch to the "off" state. Uses the
  * devicetree flags (e.g. GPIO_ACTIVE_HIGH on nice!nano v2's P0.13)
  * so a raw value of 0 here translates to "inactive" on the pin.
+ *
+ * Deliberately outside CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING: whether a
+ * vcc-gpios switch exists is a board property, independent of whether we idle
+ * the device. The init path needs to assert VCC regardless, so keeping this
+ * behind the idle-power-saving guard would leave startup unable to power the
+ * TrackPoint on boards that have the switch.
  */
 static void zmk_mouse_ps2_vcc_set(bool powered) {
     const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
@@ -2168,6 +2417,8 @@ static void zmk_mouse_ps2_vcc_set(bool powered) {
     LOG_INF("TrackPoint VCC -> %s (P%d.%02d)", powered ? "ON" : "OFF",
             config->vcc_gpio_port_num, config->vcc_gpio.pin);
 }
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING)
 
 /*
  * Parks the SCL / SDA pins in a configuration that does not back-power
@@ -2346,20 +2597,33 @@ int zmk_mouse_ps2_power_up(void) {
      *    period with no mechanical disturbance to establish a stable
      *    baseline. We do NOT send 0xFF here — a second reset would
      *    re-trigger calibration and can latch a biased baseline if
-     *    there's any residual vibration or finger contact. */
-    k_sleep(K_MSEC(100));
+     *    there's any residual vibration or finger contact.
+     *
+     *    Reporting is still off at this point, so the TrackPoint's internal
+     *    drift correction converges without anything reaching the host. That
+     *    makes this the one place where drift can be removed rather than
+     *    filtered — but every millisecond here is added wake latency, so the
+     *    default stays short and the deadzone does the bulk of the work. See
+     *    ZMK_INPUT_MOUSE_PS2_POST_POR_SETTLE_MS. */
+    k_sleep(K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_POST_POR_SETTLE_MS));
 
-    /* 6. Hard-reset the parser state and set a generous discard window.
+    /* 6. Hard-reset the parser state and open the drift-suppression window.
      *    ⚠️ CRITICAL: This MUST be done BEFORE releasing any mouse buttons
      *    (step 7), because input_report_key() may trigger internal processing
-     *    that reads wake_up_packets_to_discard or packet_buffer. If those
-     *    are not initialized yet, early drift packets won't be discarded and
-     *    will cause persistent cursor drift after wake.
-     *    The first ~30 packets after POR often carry residual drift as
-     *    the TP's internal filter converges. Discarding them prevents
-     *    any visible cursor jump. */
+     *    that reads wake_up_packets_to_discard or packet_buffer.
+     *
+     *    The discard count is deliberately small now. It exists to swallow
+     *    genuine garbage in the first few packets after POR, which is a
+     *    short-lived, byte-level problem. Recalibration drift is a much longer
+     *    one (~1-2s), and the wide discard window that used to try to cover it
+     *    was both too short to actually do so and long enough to eat the first
+     *    movement the user intended. The magnitude deadzone opened below is
+     *    what handles drift; it lets a deliberate push through immediately
+     *    while still holding back the small residual deltas. */
     zmk_mouse_ps2_activity_reset_packet_buffer();
-    zmk_mouse_ps2_request_wake_up_discard(50);
+    zmk_mouse_ps2_activity_reset_prev_packet();
+    zmk_mouse_ps2_request_wake_up_discard(10);
+    zmk_mouse_ps2_start_wake_deadzone();
 
     /* 7. Release any mouse buttons that may be stuck in the pressed
      *    state. This prevents drift caused by the parser thinking a
@@ -2367,18 +2631,7 @@ int zmk_mouse_ps2_power_up(void) {
      *    or interrupted packet sequences).
      *    ⚠️ This is done AFTER parser reset (step 6) to ensure
      *    wake_up_packets_to_discard is already set. */
-    if (data->button_l_is_held) {
-        input_report_key(data->dev, INPUT_BTN_0, 0, true, K_FOREVER);
-        data->button_l_is_held = false;
-    }
-    if (data->button_r_is_held) {
-        input_report_key(data->dev, INPUT_BTN_1, 0, true, K_FOREVER);
-        data->button_r_is_held = false;
-    }
-    if (data->button_m_is_held) {
-        input_report_key(data->dev, INPUT_BTN_2, 0, true, K_FOREVER);
-        data->button_m_is_held = false;
-    }
+    zmk_mouse_ps2_release_all_buttons();
 
     /* 8. Reapply user configuration that lives in TP RAM. */
     zmk_mouse_ps2_apply_tp_settings_impl(true);
@@ -2423,18 +2676,7 @@ static void zmk_mouse_ps2_reset_device_work_cb(struct k_work *work) {
      * presses during a desync event. If we don't do this, the host
      * computer will remain in a drag/select state even after the TP
      * is reset, because it never received the button release event. */
-    if (data->button_l_is_held) {
-        input_report_key(data->dev, INPUT_BTN_0, 0, true, K_FOREVER);
-        data->button_l_is_held = false;
-    }
-    if (data->button_r_is_held) {
-        input_report_key(data->dev, INPUT_BTN_1, 0, true, K_FOREVER);
-        data->button_r_is_held = false;
-    }
-    if (data->button_m_is_held) {
-        input_report_key(data->dev, INPUT_BTN_2, 0, true, K_FOREVER);
-        data->button_m_is_held = false;
-    }
+    zmk_mouse_ps2_release_all_buttons();
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING)
     /* Use the full VCC power cycle path */
@@ -2460,9 +2702,12 @@ static void zmk_mouse_ps2_reset_device_work_cb(struct k_work *work) {
         LOG_ERR("TP reset: device did not respond");
     }
 
-    /* Clear parser state */
+    /* Clear parser state. This path also ran a POR, so the TrackPoint will have
+     * recalibrated and needs the same drift handling as the wake path. */
     zmk_mouse_ps2_activity_reset_packet_buffer();
-    zmk_mouse_ps2_request_wake_up_discard(50);
+    zmk_mouse_ps2_activity_reset_prev_packet();
+    zmk_mouse_ps2_request_wake_up_discard(10);
+    zmk_mouse_ps2_start_wake_deadzone();
 
     /* Re-apply settings */
     zmk_mouse_ps2_apply_tp_settings_impl(true);

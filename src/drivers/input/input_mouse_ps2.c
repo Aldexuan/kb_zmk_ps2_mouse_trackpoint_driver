@@ -37,6 +37,12 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 // we give up on the packet and start fresh.
 #define MOUSE_PS2_TIMEOUT_ACTIVITY_PACKET K_MSEC(500)
 
+// A single packet can encode a movement of up to ±255 counts, but a genuine
+// TrackPoint report never gets anywhere near that at normal sample rates.
+// Anything beyond this is almost certainly a byte-stream misalignment, so we
+// drop the packet and resync instead of forwarding a cursor jump to the host.
+#define MOUSE_PS2_MOVEMENT_SANITY_LIMIT 60
+
 /*
  * PS/2 Defines
  */
@@ -401,6 +407,7 @@ void zmk_mouse_ps2_activity_move_mouse(int16_t mov_x, int16_t mov_y);
 void zmk_mouse_ps2_activity_scroll(int8_t scroll_y);
 void zmk_mouse_ps2_activity_click_buttons(bool button_l, bool button_m, bool button_r);
 void zmk_mouse_ps2_activity_reset_packet_buffer();
+void zmk_mouse_ps2_request_wake_up_discard(uint8_t packets);
 struct zmk_mouse_ps2_packet
 zmk_mouse_ps2_activity_parse_packet_buffer(zmk_mouse_ps2_packet_mode packet_mode,
                                            uint8_t packet_state, uint8_t packet_x, uint8_t packet_y,
@@ -448,7 +455,6 @@ void zmk_mouse_ps2_activity_callback(const struct device *ps2_device, uint8_t by
 }
 
 void zmk_mouse_ps2_activity_abort_cmd(char *reason) {
-    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
     // const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
 
     // LOG_ERR("PS/2 Mouse cmd buffer is out of aligment. Requesting resend: %s", reason);
@@ -456,7 +462,6 @@ void zmk_mouse_ps2_activity_abort_cmd(char *reason) {
     LOG_ERR(
         "PS/2 Mouse cmd buffer is out of alignment. igoring..."); // resend somehow make it worse
 
-    data->packet_idx = 0;
     zmk_mouse_ps2_activity_reset_packet_buffer();
 }
 
@@ -494,6 +499,25 @@ void zmk_mouse_ps2_activity_reset_packet_buffer() {
 
     data->packet_idx = 0;
     memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
+}
+
+/*
+ * Request that the next `packets` activity packets be dropped.
+ *
+ * This only ever *raises* the counter. Several stages of a single wake
+ * sequence each ask for a discard window (POR, power_up, reporting_enable),
+ * and they run in an order that is not fully fixed. A plain assignment let a
+ * later stage silently shrink an earlier stage's larger request, so the
+ * effective window was whatever happened to run last rather than what any
+ * caller asked for. Taking the maximum makes the widest request win no matter
+ * how the stages are ordered.
+ */
+void zmk_mouse_ps2_request_wake_up_discard(uint8_t packets) {
+    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+
+    if (packets > data->wake_up_packets_to_discard) {
+        data->wake_up_packets_to_discard = packets;
+    }
 }
 
 void zmk_mouse_ps2_activity_process_cmd(zmk_mouse_ps2_packet_mode packet_mode, uint8_t packet_state,
@@ -546,24 +570,29 @@ void zmk_mouse_ps2_activity_process_cmd(zmk_mouse_ps2_packet_mode packet_mode, u
     }
 #endif
 
-    zmk_mouse_ps2_activity_move_mouse(packet.mov_x, packet.mov_y);
-    zmk_mouse_ps2_activity_click_buttons(packet.button_l, packet.button_m, packet.button_r);
+    // Safety check: if movement is unreasonably large, it's likely a desync
+    // artifact. This must run BEFORE we report anything, otherwise the bogus
+    // jump has already reached the host and resyncing afterwards is pointless.
+    if (abs(packet.mov_x) > MOUSE_PS2_MOVEMENT_SANITY_LIMIT ||
+        abs(packet.mov_y) > MOUSE_PS2_MOVEMENT_SANITY_LIMIT) {
+        LOG_WRN("Detected abnormal movement (x=%d, y=%d), forcing resync.", packet.mov_x,
+                packet.mov_y);
 
-    // Safety check: If movement is unreasonably large, it's likely a desync artifact
-    if (abs(packet.mov_x) > 60 || abs(packet.mov_y) > 60) {
-        LOG_WRN("Detected abnormal drift (x=%d, y=%d), forcing resync.", 
-                packet.mov_x, packet.mov_y);
-        
         // Force reset the packet buffer to regain synchronization
-        data->packet_idx = 0;
-        memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
-        
-        // Optionally send a resend command to the device
+        zmk_mouse_ps2_activity_reset_packet_buffer();
+
+        // Ask the device to retransmit the last packet
         const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
         ps2_write(config->ps2_device, 0xFE); // RESEND command
-        
+
+        // Deliberately do not store this packet as prev_packet: it is garbage,
+        // and using it as the delta baseline would make the next legitimate
+        // packet look like a huge jump too.
         return;
     }
+
+    zmk_mouse_ps2_activity_move_mouse(packet.mov_x, packet.mov_y);
+    zmk_mouse_ps2_activity_click_buttons(packet.button_l, packet.button_m, packet.button_r);
 
     data->prev_packet = packet;
 }
@@ -929,9 +958,10 @@ int zmk_mouse_ps2_activity_reporting_enable() {
 
     // CRITICAL: Clear buffer AFTER enabling reporting to discard any "race condition" packets
     // that arrived while the system was still booting/connecting.
-    data->packet_idx = 0;
-    memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
-    data->wake_up_packets_to_discard = 20; // Discard ~200ms of initial noise
+    zmk_mouse_ps2_activity_reset_packet_buffer();
+    // Discard ~200ms of initial noise. If a caller (e.g. the wake path) already
+    // requested a wider window, that request is preserved.
+    zmk_mouse_ps2_request_wake_up_discard(20);
 
     return 0;
 }
@@ -1951,11 +1981,10 @@ int zmk_mouse_ps2_init_power_on_reset() {
 
     // CRITICAL: Clear any accumulated data in the buffer from movement during sleep/wake
     // This prevents protocol desynchronization.
-    data->packet_idx = 0;
-    memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
-    
+    zmk_mouse_ps2_activity_reset_packet_buffer();
+
     // Set discard counter to filter out initial drift/desync packets
-    data->wake_up_packets_to_discard = 10; // Increase to 10 for safety
+    zmk_mouse_ps2_request_wake_up_discard(10);
 
     return 0;
 }
@@ -2275,9 +2304,14 @@ int zmk_mouse_ps2_power_down(void) {
     /* Reset parser state so any leftover bytes from before suspend
      * (or the self-test bytes we'll get on resume) do not poison
      * the next packet stream. */
-    data->packet_idx = 0;
-    memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
+    zmk_mouse_ps2_activity_reset_packet_buffer();
     data->activity_reporting_on = false;
+
+    /* Clear the discard window here, at the one point in the cycle where no
+     * packets can arrive. zmk_mouse_ps2_request_wake_up_discard() only raises
+     * the counter, so without this a leftover count from the previous cycle
+     * would be the floor for the next one. */
+    data->wake_up_packets_to_discard = 0;
 
     /* Finally cut VCC. Do this AFTER the pins are parked low, to
      * avoid the back-powering scenario described above. */
@@ -2324,9 +2358,8 @@ int zmk_mouse_ps2_power_up(void) {
      *    The first ~30 packets after POR often carry residual drift as
      *    the TP's internal filter converges. Discarding them prevents
      *    any visible cursor jump. */
-    data->packet_idx = 0;
-    memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
-    data->wake_up_packets_to_discard = 50;
+    zmk_mouse_ps2_activity_reset_packet_buffer();
+    zmk_mouse_ps2_request_wake_up_discard(50);
 
     /* 7. Release any mouse buttons that may be stuck in the pressed
      *    state. This prevents drift caused by the parser thinking a
@@ -2428,9 +2461,8 @@ static void zmk_mouse_ps2_reset_device_work_cb(struct k_work *work) {
     }
 
     /* Clear parser state */
-    data->packet_idx = 0;
-    memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
-    data->wake_up_packets_to_discard = 50;
+    zmk_mouse_ps2_activity_reset_packet_buffer();
+    zmk_mouse_ps2_request_wake_up_discard(50);
 
     /* Re-apply settings */
     zmk_mouse_ps2_apply_tp_settings_impl(true);

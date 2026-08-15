@@ -2670,6 +2670,7 @@ static K_WORK_DEFINE(zmk_mouse_ps2_reset_device_work, zmk_mouse_ps2_reset_device
 static void zmk_mouse_ps2_reset_device_work_cb(struct k_work *work) {
     ARG_UNUSED(work);
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+    const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
 
     LOG_INF("TrackPoint full reset triggered by user");
 
@@ -2680,43 +2681,67 @@ static void zmk_mouse_ps2_reset_device_work_cb(struct k_work *work) {
      * is reset, because it never received the button release event. */
     zmk_mouse_ps2_release_all_buttons();
 
-#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING)
-    /* Use the full VCC power cycle path */
-    zmk_mouse_ps2_power_down();
-    k_sleep(K_MSEC(200)); /* Let TP caps discharge */
-    zmk_mouse_ps2_power_up();
-#else
-    /* No VCC control available; do a software-only reset */
-    const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
-
+    /* Disable reporting and suspend transport (UART, pins) regardless of
+     * whether IDLE_POWER_SAVING is enabled. MS_TP_RESET is an emergency
+     * recovery command that must perform a complete hardware reset. */
     zmk_mouse_ps2_activity_reporting_disable();
 
-    /* Send PS/2 reset command */
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING)
+    /* If IDLE_POWER_SAVING is enabled, transport_suspend is compiled in */
+    zmk_mouse_ps2_transport_suspend();
+#else
+    /* Manually disable callback even when IDLE_POWER_SAVING is off */
+    ps2_disable_callback(config->ps2_device);
+#endif
+
+    /* Cut VCC if hardware switch is available (vcc-gpios in DTS).
+     * zmk_mouse_ps2_vcc_set is always compiled; it's a no-op if
+     * vcc-gpios is not defined. */
+    zmk_mouse_ps2_vcc_set(false);
+    k_sleep(K_MSEC(200)); /* Let TP capacitors discharge */
+
+    /* Restore VCC */
+    zmk_mouse_ps2_vcc_set(true);
+    k_sleep(K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING_WAKE_DELAY_MS));
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING)
+    /* Resume transport if we suspended it above */
+    zmk_mouse_ps2_transport_resume();
+#else
+    /* Manually re-enable callback */
+    ps2_enable_callback(config->ps2_device);
+#endif
+
+    /* Send PS/2 reset command (may be redundant if VCC was cycled, but ensures
+     * software-level reset for boards without vcc-gpios control) */
     zmk_mouse_ps2_reset(config->ps2_device);
     k_sleep(K_MSEC(500));
 
-    /* Re-run POR if RST pin is available */
+    /* Re-run POR sequence if RST pin is available (rst-gpios in DTS) */
     zmk_mouse_ps2_init_power_on_reset();
 
-    /* Re-detect device */
+    /* Re-detect device (consumes self-test bytes) */
     int err = zmk_mouse_ps2_init_wait_for_mouse(data->dev);
     if (err) {
-        LOG_ERR("TP reset: device did not respond");
+        LOG_ERR("TP reset: device did not respond after reset sequence");
+        /* Continue anyway — user can retry if needed */
     }
 
-    /* Clear parser state. This path also ran a POR, so the TrackPoint will have
+    /* Clear parser state. This path ran a POR, so the TrackPoint has
      * recalibrated and needs the same drift handling as the wake path. */
     zmk_mouse_ps2_activity_reset_packet_buffer();
     zmk_mouse_ps2_activity_reset_prev_packet();
-    zmk_mouse_ps2_request_wake_up_discard(10);
+    zmk_mouse_ps2_request_wake_up_discard(30);  // Use same wider window as POR
     zmk_mouse_ps2_start_wake_deadzone();
 
-    /* Re-apply settings */
+    /* Re-apply user settings (sensitivity, inertia, etc.) */
     zmk_mouse_ps2_apply_tp_settings_impl(true);
 
     /* Re-enable reporting */
-    zmk_mouse_ps2_activity_reporting_enable();
-#endif
+    err = zmk_mouse_ps2_activity_reporting_enable();
+    if (err) {
+        LOG_ERR("TP reset: failed to re-enable reporting (%d)", err);
+    }
 
     LOG_INF("TrackPoint full reset complete");
 }

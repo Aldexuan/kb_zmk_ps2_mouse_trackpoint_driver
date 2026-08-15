@@ -2682,8 +2682,6 @@ static K_WORK_DEFINE(zmk_mouse_ps2_reset_device_work, zmk_mouse_ps2_reset_device
 
 static void zmk_mouse_ps2_reset_device_work_cb(struct k_work *work) {
     ARG_UNUSED(work);
-    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
-    const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
 
     LOG_INF("TrackPoint full reset triggered by user");
 
@@ -2700,18 +2698,33 @@ static void zmk_mouse_ps2_reset_device_work_cb(struct k_work *work) {
     k_sleep(K_MSEC(200)); /* Let TP caps discharge */
     zmk_mouse_ps2_power_up();
 #else
-    /* No VCC control available; do a software-only reset */
+    /* Reset via the RST pin only, mirroring the ordering power_up() uses.
+     *
+     * Exactly ONE reset mechanism runs here, never two. This path used to send
+     * 0xFF as well, 500ms before asserting RST, and the two overlapped: 0xFF
+     * starts a self test that the IBM spec times at 600ms, so the 500ms sleep
+     * expired while it was still running and RST cut it off partway through.
+     * init_wait_for_mouse() then read the truncated remains instead of 0xAA,
+     * took them for a failed self test, and sent yet another 0xFF (see the
+     * `read_val != MOUSE_PS2_RESP_SELF_TEST_PASS` branch) — - each retry
+     * stacking one more reset onto an unfinished one, so the byte stream never
+     * realigned and the pointer stayed dead until the MCU restarted.
+     *
+     * power_up() documents the same hazard from the other side: it deliberately
+     * does not send 0xFF after its own POR, because a second reset re-triggers
+     * calibration. Doing one reset and letting it finish is what makes this
+     * work. */
     zmk_mouse_ps2_activity_reporting_disable();
 
-    /* Send PS/2 reset command */
-    zmk_mouse_ps2_reset(config->ps2_device);
-    k_sleep(K_MSEC(500));
-
-    /* Re-run POR if RST pin is available */
+    /* Holds RST for POWER_ON_RESET_TIME (600ms), then releases it. */
     zmk_mouse_ps2_init_power_on_reset();
 
-    /* Re-detect device */
-    int err = zmk_mouse_ps2_init_wait_for_mouse(data->dev);
+    /* Let the self test that POR just started actually complete before reading,
+     * the same settle the wake path takes. */
+    k_sleep(K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_POST_POR_SETTLE_MS));
+
+    /* Re-detect device (consumes the 0xAA / 0x00 the POR produced) */
+    int err = zmk_mouse_ps2_init_wait_for_mouse(zmk_mouse_ps2_data.dev);
     if (err) {
         LOG_ERR("TP reset: device did not respond");
     }

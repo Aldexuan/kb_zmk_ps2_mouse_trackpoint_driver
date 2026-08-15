@@ -79,12 +79,17 @@ static int mouse_ps2_activity_listener(const zmk_event_t *eh) {
         zmk_mouse_ps2_submit_work(&mouse_ps2_power_up_work);
         break;
     case ZMK_ACTIVITY_IDLE:
-    case ZMK_ACTIVITY_SLEEP:
-        /* In SLEEP, ZMK will cut the whole board anyway via the LDO
-         * deep sleep path. We still queue power_down so that the
-         * driver's internal state (packet buffer, reporting flag)
-         * is reset and on resume we go through the full POR cycle. */
+        /* Idle timeout: optionally power down the TrackPoint to save energy.
+         * Only takes effect if CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING=y. */
         zmk_mouse_ps2_submit_work(&mouse_ps2_power_down_work);
+        break;
+    case ZMK_ACTIVITY_SLEEP:
+        /* Deep sleep (System OFF): the MCU will fully power down and restart.
+         * On restart, zmk_mouse_ps2_init() runs automatically and performs a
+         * complete TrackPoint initialization. Calling power_down() here would
+         * confuse the state machine (mouse_ps2_is_down gets reset on MCU restart,
+         * causing the ACTIVE event handler to skip power_up()). The init path
+         * already handles everything correctly, so we do nothing here. */
         break;
     default:
         break;

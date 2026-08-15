@@ -2228,23 +2228,10 @@ int zmk_mouse_ps2_init_power_on_reset() {
     // This prevents protocol desynchronization.
     zmk_mouse_ps2_activity_reset_packet_buffer();
 
-    // Actively drain any stale bytes from the PS/2 hardware buffer that may have
-    // arrived during the POR sequence or power transition. Without this, a partial
-    // packet or protocol byte (e.g., a late ACK) can sit in the UART FIFO and cause
-    // the first real packet to decode at a one-byte offset, manifesting as phantom
-    // left drift due to a misinterpreted sign bit.
-    uint8_t dummy;
-    int flushed_count = 0;
-    while (ps2_read(config->ps2_device, &dummy) == 0 && flushed_count < 10) {
-        LOG_DBG("Flushed stale byte during POR: 0x%02x", dummy);
-        flushed_count++;
-    }
-    if (flushed_count > 0) {
-        LOG_INF("Drained %d stale byte(s) from PS/2 buffer after POR", flushed_count);
-    }
-
-    // Set discard counter to filter out initial drift/desync packets
-    zmk_mouse_ps2_request_wake_up_discard(10);
+    // Widen the post-wake discard window to cover more potential misalignment.
+    // Increased from 10 to 30 packets (~300ms at 100Hz) to better handle cases
+    // where stale bytes or protocol desync cause phantom left drift on wake.
+    zmk_mouse_ps2_request_wake_up_discard(30);
 
     return 0;
 }

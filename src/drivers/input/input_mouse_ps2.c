@@ -32,6 +32,12 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 // How often the driver try to initialize a mouse before we give up.
 #define MOUSE_PS2_INIT_ATTEMPTS 10
 
+// Retry budget for the user-triggered reset (MS_TP_RESET). Much smaller than the
+// boot budget: the reset runs on the PS/2 maintenance queue in response to a key
+// press, so it has to finish in a second or two rather than sleep for ~25s while
+// further presses coalesce into the already-queued work item.
+#define MOUSE_PS2_RESET_INIT_ATTEMPTS 3
+
 // Mouse activity packets are at least three bytes.
 // This defines how much time between bytes can pass before
 // we give up on the packet and start fresh.
@@ -1194,6 +1200,61 @@ int zmk_mouse_ps2_activity_reporting_enable() {
     return 0;
 }
 
+/*
+ * Force the reporting state, ignoring the cached activity_reporting_on flag.
+ *
+ * The normal enable/disable pair is guarded by that flag so repeated calls are
+ * cheap, and it only updates the flag after ps2_write() succeeds. Together those
+ * two properties can wedge the driver permanently:
+ *
+ *   1. Something goes wrong on the wire (a desynced TrackPoint, a dropped or
+ *      late ACK) while sending 0xF5. The device *does* stop reporting, but
+ *      ps2_write() reports failure, so disable() returns early with the flag
+ *      still true.
+ *   2. Any later enable() sees the flag already true and returns 0 without ever
+ *      putting 0xF4 on the wire.
+ *
+ * The driver now believes reporting is on while the device has it off. No amount
+ * of retrying escapes it, because every retry takes the same two early exits —
+ * which is exactly why a wedged TrackPoint stayed dead until a deep-sleep or
+ * power-cycle reinitialised the flag from its static initialiser.
+ *
+ * This variant always writes the command and always syncs the flag to the
+ * requested state, even on write failure: once a write has failed the device's
+ * true state is unknown, and assuming it took effect is strictly better than
+ * leaving a stale flag that blocks all future attempts. Used only by the
+ * user-triggered reset path, where "recover no matter what" beats "avoid a
+ * redundant byte".
+ */
+static int zmk_mouse_ps2_reporting_force_resync(bool enable) {
+    struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
+    const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
+    const struct device *ps2_device = config->ps2_device;
+
+    uint8_t cmd = enable ? MOUSE_PS2_CMD_ENABLE_REPORTING[0] : MOUSE_PS2_CMD_DISABLE_REPORTING[0];
+
+    int err = ps2_write(ps2_device, cmd);
+    if (err) {
+        LOG_WRN("Force-resync: 0x%02x write failed (%d); syncing flag anyway", cmd, err);
+    }
+
+    if (enable) {
+        int cb_err = ps2_enable_callback(ps2_device);
+        if (cb_err) {
+            LOG_WRN("Force-resync: could not enable ps2 callback (%d)", cb_err);
+        }
+    } else {
+        int cb_err = ps2_disable_callback(ps2_device);
+        if (cb_err) {
+            LOG_WRN("Force-resync: could not disable ps2 callback (%d)", cb_err);
+        }
+    }
+
+    data->activity_reporting_on = enable;
+
+    return err;
+}
+
 int zmk_mouse_ps2_activity_reporting_disable() {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
     const struct zmk_mouse_ps2_config *config = &zmk_mouse_ps2_config;
@@ -1853,6 +1914,21 @@ int zmk_mouse_ps2_tp_pts_threshold_change(int amount) {
  * State Saving
  */
 
+/* Debounce window for flushing PS/2 mouse settings to flash.
+ *
+ * Deliberately NOT CONFIG_ZMK_SETTINGS_SAVE_DEBOUNCE. That is a global ZMK
+ * setting whose upstream default is 60s, which is long enough for the board to
+ * enter deep sleep before the write ever lands. When that happens the MCU
+ * powers down, the pending work item dies with the RAM it lived in, and every
+ * runtime adjustment made through `&mms` is silently lost: the new value is
+ * live in the TrackPoint until the next boot, then reverts to whatever is in
+ * flash. Raising the global would change the save cadence of every other ZMK
+ * subsystem, so this driver keeps its own shorter window instead.
+ *
+ * A short window is safe here: these saves happen only when the user actively
+ * adjusts a setting, and each one writes four single-byte values. */
+#define MOUSE_PS2_SETTINGS_SAVE_DEBOUNCE_MS 10000
+
 #if IS_ENABLED(CONFIG_SETTINGS)
 
 struct k_work_delayable zmk_mouse_ps2_save_work;
@@ -1904,7 +1980,7 @@ int zmk_mouse_ps2_settings_save() {
 
 #if IS_ENABLED(CONFIG_SETTINGS)
     int ret =
-        k_work_reschedule(&zmk_mouse_ps2_save_work, K_MSEC(CONFIG_ZMK_SETTINGS_SAVE_DEBOUNCE));
+        k_work_reschedule(&zmk_mouse_ps2_save_work, K_MSEC(MOUSE_PS2_SETTINGS_SAVE_DEBOUNCE_MS));
     return MIN(ret, 0);
 #else
     return 0;
@@ -2236,16 +2312,28 @@ int zmk_mouse_ps2_init_power_on_reset() {
     return 0;
 }
 
-int zmk_mouse_ps2_init_wait_for_mouse(const struct device *dev) {
+/*
+ * Wait for a PS/2 mouse to identify itself, giving up after `attempts` rounds.
+ *
+ * The retry budget is a parameter because the two callers have opposite needs.
+ * Boot can afford to be patient (the device may still be powering up, and there
+ * is nothing else to do). The user-triggered reset cannot: every failing round
+ * costs a blocking ps2_read timeout plus, on odd rounds, a 5-second sleep, and
+ * all of it runs on the single-threaded PS/2 maintenance queue. At the boot
+ * budget of 10 that is ~25s of sleeping alone, during which the queue is
+ * occupied and further MS_TP_RESET presses coalesce into the already-queued work
+ * item and appear to do nothing — the "pressing it repeatedly doesn't help"
+ * symptom. A short budget keeps the reset interactive.
+ */
+int zmk_mouse_ps2_init_wait_for_mouse_attempts(const struct device *dev, int attempts) {
     const struct zmk_mouse_ps2_config *config = dev->config;
     int err;
 
     uint8_t read_val;
 
-    for (int i = 0; i < MOUSE_PS2_INIT_ATTEMPTS; i++) {
+    for (int i = 0; i < attempts; i++) {
 
-        LOG_INF("Trying to initialize mouse device (attempt %d / %d)", i + 1,
-                MOUSE_PS2_INIT_ATTEMPTS);
+        LOG_INF("Trying to initialize mouse device (attempt %d / %d)", i + 1, attempts);
 
         // PS/2 Devices do a self-test and send the result when they power up.
 
@@ -2289,10 +2377,18 @@ int zmk_mouse_ps2_init_wait_for_mouse(const struct device *dev) {
             continue;
         }
 
-        k_sleep(K_SECONDS(5));
+        /* Only the patient (boot) budget sleeps between rounds. The short
+         * budget used by the reset path must stay responsive. */
+        if (attempts >= MOUSE_PS2_INIT_ATTEMPTS) {
+            k_sleep(K_SECONDS(5));
+        }
     }
 
     return 1;
+}
+
+int zmk_mouse_ps2_init_wait_for_mouse(const struct device *dev) {
+    return zmk_mouse_ps2_init_wait_for_mouse_attempts(dev, MOUSE_PS2_INIT_ATTEMPTS);
 }
 
 // Depends on the UART and PS2 init priorities, which are 55 and 45 by default
@@ -2420,11 +2516,18 @@ static void zmk_mouse_ps2_vcc_set(bool powered) {
             config->vcc_gpio_port_num, config->vcc_gpio.pin);
 }
 
-#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING)
-
 /*
  * Parks the SCL / SDA pins in a configuration that does not back-power
  * the (now-unpowered) TrackPoint via its ESD clamp diodes.
+ *
+ * Deliberately compiled unconditionally, like zmk_mouse_ps2_vcc_set(). Parking
+ * the pins is not a power-saving feature: it is a *precondition for cutting VCC
+ * at all*. Cutting VCC while SCL/SDA are still driven leaves the TrackPoint
+ * sitting at a parasitic 1.5-2V through its clamp diodes — below its operating
+ * voltage but above zero, i.e. a brownout state in which it neither runs nor
+ * resets. The user-triggered full reset (MS_TP_RESET) needs a true 0V power
+ * cycle to recover a wedged device, so it must be able to call this regardless
+ * of whether idle power saving is enabled.
  *
  * - SDA belongs to the UART peripheral, so we switch the UART pinctrl
  *   to its "sleep" state. The user's DTS must define uart0_ps2_sleep
@@ -2546,6 +2649,8 @@ static void zmk_mouse_ps2_transport_resume(void) {
         uart_irq_rx_enable(uart_dev);
     }
 }
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING)
 
 int zmk_mouse_ps2_power_down(void) {
     struct zmk_mouse_ps2_data *data = &zmk_mouse_ps2_data;
@@ -2681,50 +2786,44 @@ static void zmk_mouse_ps2_reset_device_work_cb(struct k_work *work) {
      * is reset, because it never received the button release event. */
     zmk_mouse_ps2_release_all_buttons();
 
-    /* Disable reporting and suspend transport (UART, pins) regardless of
-     * whether IDLE_POWER_SAVING is enabled. MS_TP_RESET is an emergency
-     * recovery command that must perform a complete hardware reset. */
-    zmk_mouse_ps2_activity_reporting_disable();
+    /* Stop reporting via the forcing variant, never the cached one. The device
+     * is by definition in an unknown state when the user reaches for this key,
+     * which is precisely the situation where the cached-flag path can leave the
+     * driver and the device disagreeing about whether reporting is on. */
+    zmk_mouse_ps2_reporting_force_resync(false);
 
-#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING)
-    /* If IDLE_POWER_SAVING is enabled, transport_suspend is compiled in */
+    /* Park SCL/SDA before touching VCC. Without this the pins keep the TP alive
+     * at a parasitic 1.5-2V through its ESD clamp diodes, so it neither runs nor
+     * resets and comes back wedged rather than freshly booted. */
     zmk_mouse_ps2_transport_suspend();
-#else
-    /* Manually disable callback even when IDLE_POWER_SAVING is off */
-    ps2_disable_callback(config->ps2_device);
-#endif
 
-    /* Cut VCC if hardware switch is available (vcc-gpios in DTS).
-     * zmk_mouse_ps2_vcc_set is always compiled; it's a no-op if
-     * vcc-gpios is not defined. */
+    /* Cut VCC. No-op if the board has no vcc-gpios switch, in which case the
+     * 0xFF command below is the only reset mechanism available. */
     zmk_mouse_ps2_vcc_set(false);
     k_sleep(K_MSEC(200)); /* Let TP capacitors discharge */
 
-    /* Restore VCC */
+    /* Restore VCC and bring the transport back up. */
     zmk_mouse_ps2_vcc_set(true);
     k_sleep(K_MSEC(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING_WAKE_DELAY_MS));
-
-#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_IDLE_POWER_SAVING)
-    /* Resume transport if we suspended it above */
     zmk_mouse_ps2_transport_resume();
-#else
-    /* Manually re-enable callback */
-    ps2_enable_callback(config->ps2_device);
-#endif
 
-    /* Send PS/2 reset command (may be redundant if VCC was cycled, but ensures
-     * software-level reset for boards without vcc-gpios control) */
+    /* Software reset as well: redundant when VCC was actually cycled, but it is
+     * the entire reset on boards without a vcc-gpios switch. */
     zmk_mouse_ps2_reset(config->ps2_device);
     k_sleep(K_MSEC(500));
 
     /* Re-run POR sequence if RST pin is available (rst-gpios in DTS) */
     zmk_mouse_ps2_init_power_on_reset();
 
-    /* Re-detect device (consumes self-test bytes) */
-    int err = zmk_mouse_ps2_init_wait_for_mouse(data->dev);
+    /* Re-detect with a short budget: this is an interactive key press, so it
+     * must not hold the PS/2 queue for the ~25s the boot budget can take. */
+    int err = zmk_mouse_ps2_init_wait_for_mouse_attempts(data->dev,
+                                                         MOUSE_PS2_RESET_INIT_ATTEMPTS);
     if (err) {
         LOG_ERR("TP reset: device did not respond after reset sequence");
-        /* Continue anyway — user can retry if needed */
+        /* Fall through and finish the sequence anyway. Reporting is re-armed
+         * unconditionally at the end, so a device that comes back a moment late
+         * still works, and the user can simply press the key again. */
     }
 
     /* Clear parser state. This path ran a POR, so the TrackPoint has
@@ -2737,11 +2836,14 @@ static void zmk_mouse_ps2_reset_device_work_cb(struct k_work *work) {
     /* Re-apply user settings (sensitivity, inertia, etc.) */
     zmk_mouse_ps2_apply_tp_settings_impl(true);
 
-    /* Re-enable reporting */
-    err = zmk_mouse_ps2_activity_reporting_enable();
-    if (err) {
-        LOG_ERR("TP reset: failed to re-enable reporting (%d)", err);
-    }
+    /* Re-arm reporting with the forcing variant. Using the cached-flag version
+     * here is what previously made this key a one-way trip into a dead pointer:
+     * if the flag was still true from a failed disable, 0xF4 was never sent. */
+    zmk_mouse_ps2_reporting_force_resync(true);
+
+    /* The forcing helper does not clear the parser state, so do it here — the
+     * 0xF4 ACK and any self-test bytes must not be parsed as movement. */
+    zmk_mouse_ps2_activity_reset_packet_buffer();
 
     LOG_INF("TrackPoint full reset complete");
 }
